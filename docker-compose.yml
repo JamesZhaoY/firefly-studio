@@ -1,0 +1,59 @@
+name: firefly-studio
+
+services:
+  api:
+    build: .
+    image: firefly-studio:latest
+    container_name: firefly-api
+    restart: unless-stopped
+    ports:
+      - "19999:19999"
+    volumes:
+      # Persistent credentials + SQLite. Mount a host dir so data survives
+      # container recreation. Default path: ./data on the host.
+      - ./data:/data
+      - ./outputs:/app/outputs
+    environment:
+      PORT: "19999"
+      FLASK_HOST: "0.0.0.0"
+      FLASK_DEBUG: "0"
+      PYTHONUNBUFFERED: "1"
+      # Public origin of your Cloudflare-proxied frontend (comma-separated).
+      # Leave as * for local testing only.
+      CORS_ORIGINS: "https://your-frontend.example.com"
+
+      # ── Adobe credentials ──────────────────────────────────────
+      # Two options:
+      #
+      # 1) Inline via env (good for cloud / VPS):
+      #    paste the FULL file contents as the env value.
+      #
+      # 2) File-mount (preferred for self-host):
+      #    remove the two STORAGE_JSON / TOKEN_JSON lines below and mount
+      #    the files via additional_volumes:
+      #      - ./secrets/storage.json:/data/storage.json:ro
+      #      - ./secrets/current_token.json:/data/current_token.json:ro
+      STORAGE_JSON: ""
+      TOKEN_JSON: ""
+
+      # ── (Optional) Force upstream requests through Cloudflare ──
+      # See docker-deploy.md §"Cloudflare forward proxy".
+      # Leave empty to use curl_cffi's direct connection (recommended).
+      HTTPS_PROXY: ""
+      # curl_cffi reads this for the proxy URL when set:
+      #   https://your-cf-tunnel.example.com
+      # Disable certificate verification is normally NOT needed because
+      # Cloudflare presents a valid public cert. Only flip if your
+      # tunnel uses a private CA.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; \
+        sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:19999/api/health', timeout=3).status==200 else sys.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
