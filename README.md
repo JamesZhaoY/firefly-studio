@@ -156,10 +156,10 @@ POST /api/generate
 ## 生产部署
 
 - **本地开发**：`python app.py` + `cd frontend && npm run dev`，全部 127.0.0.1 访问
-- **Docker 自托管**（VPS / 家用服务器）：见 `docker-deploy.md`
-  - `docker compose up -d --build`，后端监听 **:19999**
-  - 可叠加 **Cloudflare Tunnel / Worker** 反向代理（无需公网 IP）
-  - Cloudflare Worker + curl_cffi 后端 = 推荐架构（保留 Adobe 指纹，绕过 408）
+- **Docker 自托管**（ECS / VPS）：见 `docker-deploy.md`
+  - **单容器方案**：Nginx :19999 服务前端 + 反代 `/api/*` → Gunicorn :19998 → curl_cffi → Adobe
+  - 出口 Adobe 流量经 **Cloudflare WARP sidecar**（绕开国内 ISP 阻断）
+  - ECS 安全组开 19999 入站；可叠加 CF Tunnel / 域名 / Caddy HTTPS
 
 ---
 

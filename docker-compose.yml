@@ -1,59 +1,74 @@
 name: firefly-studio
 
+# Architecture (one container, two responsibilities):
+#
+#   国内用户 ─► ECS :19999 (公网IP) ─► [nginx :19999]
+#                                          ├─ /             → React static (build)
+#                                          └─ /api/*        → gunicorn :19998 (Flask)
+#                                                              └─ curl_cffi → WARP → CF → Adobe
+#
+# WARP is a sidecar; api container shares its network stack.
+
 services:
-  api:
+  app:
     build: .
     image: firefly-studio:latest
-    container_name: firefly-api
+    container_name: firefly-app
     restart: unless-stopped
+    # Only ONE public port. Nginx listens here; it forwards /api/* to gunicorn.
     ports:
       - "19999:19999"
     volumes:
-      # Persistent credentials + SQLite. Mount a host dir so data survives
-      # container recreation. Default path: ./data on the host.
+      # Persistent Adobe credentials + SQLite. Mount a host dir so the DB
+      # survives `docker compose down` / `docker rm`.
       - ./data:/data
       - ./outputs:/app/outputs
+    # All outbound traffic (curl_cffi → Adobe) goes through the WARP sidecar.
+    network_mode: "service:warp"
+    depends_on:
+      warp:
+        condition: service_healthy
     environment:
-      PORT: "19999"
-      FLASK_HOST: "0.0.0.0"
+      # gunicorn binds to internal port (nginx proxies in)
+      PORT: "19998"
+      FLASK_HOST: "127.0.0.1"
       FLASK_DEBUG: "0"
       PYTHONUNBUFFERED: "1"
-      # Public origin of your Cloudflare-proxied frontend (comma-separated).
-      # Leave as * for local testing only.
-      CORS_ORIGINS: "https://your-frontend.example.com"
-
-      # ── Adobe credentials ──────────────────────────────────────
-      # Two options:
-      #
-      # 1) Inline via env (good for cloud / VPS):
-      #    paste the FULL file contents as the env value.
-      #
-      # 2) File-mount (preferred for self-host):
-      #    remove the two STORAGE_JSON / TOKEN_JSON lines below and mount
-      #    the files via additional_volumes:
-      #      - ./secrets/storage.json:/data/storage.json:ro
-      #      - ./secrets/current_token.json:/data/current_token.json:ro
+      # CORS — set to your actual frontend origin (or * for testing).
+      CORS_ORIGINS: "*"
+      # Adobe credentials (paste full JSON contents as single line)
       STORAGE_JSON: ""
       TOKEN_JSON: ""
+    # Note: nginx is launched by the Dockerfile CMD after writing secrets,
+    # so no separate nginx service here.
 
-      # ── (Optional) Force upstream requests through Cloudflare ──
-      # See docker-deploy.md §"Cloudflare forward proxy".
-      # Leave empty to use curl_cffi's direct connection (recommended).
-      HTTPS_PROXY: ""
-      # curl_cffi reads this for the proxy URL when set:
-      #   https://your-cf-tunnel.example.com
-      # Disable certificate verification is normally NOT needed because
-      # Cloudflare presents a valid public cert. Only flip if your
-      # tunnel uses a private CA.
+  # ── WARP sidecar (outbound to Adobe via Cloudflare) ─────────
+  warp:
+    image: caomingjun/warp:latest
+    container_name: firefly-warp
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    # First boot: register + license + connect. Later boots: just connect.
+    command: >
+      sh -c "
+        if [ ! -f /var/lib/cloudflare-warp/reg.json ]; then
+          warp-cli registration new;
+          warp-cli connect;
+        else
+          warp-cli connect;
+        fi;
+        sleep infinity
+      "
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; \
-        sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:19999/api/health', timeout=3).status==200 else sys.exit(1)"]
+      test: ["CMD-SHELL", "warp-cli status | grep -q Connected"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 5
-      start_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      start_period: 30s
+
+volumes:
+  warp-data: {}

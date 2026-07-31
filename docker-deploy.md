@@ -2,26 +2,29 @@
 
 ## 架构
 
+**单容器架构**（你要求的方案）：Nginx 在 19999 同时服务前端静态 + 反向代理 `/api/*` 到同容器内的 Gunicorn。出口 Adobe 流量走 WARP sidecar。
+
 ```
-浏览器 / GitHub Pages 前端
-        │
-        │ HTTPS (Cloudflare proxy)
-        ▼
-Cloudflare（域名 + WAF + Tunnel + WARP 出口）
-        │
-        │ 反向代理到 VPS
-        ▼
-Docker 容器（firefly-studio, :19999）
-        │
-        │ curl_cffi  →  Cloudflare WARP 出口  →  Adobe
-        ▼
-Adobe Firefly 3P（firefly.adobe.com / firefly-3p.ff.adobe.io / ims）
+国内用户 ─► 阿里云 ECS :19999 (公网IP)
+              │
+              ▼
+           Docker 容器
+              │
+              ├─ Nginx :19999
+              │    ├─ /              → React 构建产物 (frontend/dist)
+              │    └─ /api/*         → Gunicorn :19998 (Flask)
+              │                          └─ curl_cffi → WARP sidecar → CF 边缘 → Adobe
+              │
+              └─ WARP sidecar (caomingjun/warp)
+                   └─ 全部出站走 Cloudflare Anycast
 ```
 
-后端端口：**19999**
+- 入站端口：**19999**（公网，单一）
+- 入站不需要 Cloudflare（你自己评估要不要加 WAF）
+- 出站 Adobe 强制走 Cloudflare WARP（绕开国内 ISP 阻断）
 
 > **国内 VPS（阿里云、腾讯云）** → Adobe 直连被墙 / 限速。
-> 必须在容器里走 **Cloudflare WARP** 或等价方案才能稳定跑（详见 §3.5）。
+> WARP 在容器内零成本解决（详见 §4）。
 
 ---
 
@@ -74,75 +77,172 @@ docker compose --env-file .env up -d --build
 
 ### 1.3 验证
 
-```powershell
+```bash
+# 容器内 API（Nginx 反代过）
 curl http://127.0.0.1:19999/api/health
-# {"ok":true,"auth":{"token_ok":true,"client_id":"clio-playground-web",...}}
+# → {"ok":true,"auth":{"token_ok":true,"client_id":"clio-playground-web",...}}
+
+# 前端首页
+curl -I http://127.0.0.1:19999/
+# → HTTP/1.1 200 OK · Content-Type: text/html
+
+# 静态资源
+curl -I http://127.0.0.1:19999/assets/index-xxx.js
+# → 200 + Cache-Control: public, immutable
+
+# WARP 出口验证
+docker compose exec warp warp-cli status    # Connected
+docker compose exec app curl https://www.cloudflare.com/cdn-cgi/trace | head
+# fl=行最后 4 字符应该是 CF 节点 IP（不是阿里云 IP）
 ```
 
 查看日志：
 
 ```bash
-docker compose logs -f api
+docker compose logs -f app
+docker compose logs -f warp
 ```
 
 ---
 
-## 2. 部署到 VPS（自托管）
+## 2. 部署到阿里云 ECS（自托管）
 
-任何支持 Docker 的 VPS 都可以（DigitalOcean、BandwagonHost、AWS Lightsail、Oracle Cloud Free Tier 等）。
+### 2.0 ECS 安全组（控制台）
+
+| 方向 | 端口 | 来源 | 说明 |
+|------|------|------|------|
+| 入 | 19999 | `0.0.0.0/0` 或你的客户端 IP 段 | 前端 + API 共用 |
+| 出 | ALL | `0.0.0.0/0` | 让 WARP sidecar 能访问 CF 边缘 |
+
+> 不需要开放 80/443 — 容器自己服务 19999。
+> 不需要 CF Tunnel 入站 — CF 只做出口（见 §4）。
+> 不想暴露公网 IP，可加 CF Tunnel 反向代理到 19999（见 §3）。
 
 ### 2.1 上服务器
 
 ```bash
-# 在本地
-scp -r app.py db.py firefly_pipeline.py models_catalog.py wsgi.py \
-       requirements.txt Dockerfile docker-compose.yml \
-       user@your-vps:/app/firefly-studio/
+# 本地（Windows）
+scp app.py db.py firefly_pipeline.py models_catalog.py wsgi.py \
+    requirements.txt Dockerfile docker-compose.yml nginx.conf \
+    user@your-ecs:/app/firefly-studio/
+
+# 前端在 docker build 里现编，不需要传 dist/
+# 如果要跳过 build 直接用本地构建结果，可：
+#   scp -r frontend/dist user@your-ecs:/app/firefly-studio/frontend/
+
+# Adobe 凭证（scp 或 ssh 复制）
+ssh user@your-ecs "mkdir -p /app/firefly-studio/data"
 scp data/storage.json data/current_token.json \
-       user@your-vps:/app/firefly-studio/data/
-# （如果之前没传过 data/ 目录）
-ssh user@your-vps "mkdir -p /app/firefly-studio/data /app/firefly-studio/outputs"
+    user@your-ecs:/app/firefly-studio/data/
+# 或者用 .env 文件注入（见下）
 ```
 
 ### 2.2 服务器上启动
 
 ```bash
-ssh user@your-vps
+ssh user@your-ecs
 cd /app/firefly-studio
+
+# 方式 A：用 .env 文件注入凭证（推荐）
+cat > .env <<EOF
+STORAGE_JSON='$(cat data/storage.json)'
+TOKEN_JSON='$(cat data/current_token.json)'
+CORS_ORIGINS=*
+EOF
+
+docker compose --env-file .env up -d --build
+
+# 方式 B：凭证放 data/，docker-compose 用 volume 挂载
+# 编辑 docker-compose.yml，把 STORAGE_JSON/TOKEN_JSON 留空，
+# 并确保 ./data:/data 已挂载 data/storage.json
 docker compose up -d --build
-sudo ufw allow 19999/tcp     # 防火墙
-# 或只暴露 80/443（见 §3）
 ```
 
-### 2.3 域名 + 反向代理（建议用 nginx 或 Caddy）
+### 2.3 国内访问
 
-**Caddy（最简单，自动 HTTPS）**：
+用户直接访问 `http://your-ecs-ip:19999/` 即可：
+
+- `/`  → React 前端
+- `/api/*` → Flask 后端
+
+如果要绑域名（推荐，国内访问 IP 不优雅）：
+
+**阿里云 DNS** 解析一条 A 记录到 ECS 公网 IP，然后用 Caddy / nginx 加 HTTPS（容器端口 19999 不支持 HTTPS，需在宿主机加一层）：
 
 ```bash
+# ECS 上
 sudo apt install -y caddy
 ```
 
 `/etc/caddy/Caddyfile`：
 
 ```
-api.your-domain.com {
+firefly.your-domain.com {
     reverse_proxy 127.0.0.1:19999
 }
 ```
 
 ```bash
 sudo systemctl reload caddy
+# → https://firefly.your-domain.com
+```
+
+> 不想要 Cloudflare 也能跑。CF 在这套架构里只承担**出站**（去 Adobe），不进站。
+
+### 2.4 验证
+
+```bash
+# 前端
+curl -I http://your-ecs-ip:19999/
+# HTTP/1.1 200 OK · Content-Type: text/html
+
+# API
+curl http://your-ecs-ip:19999/api/health
+
+# WARP 出口
+docker compose exec warp warp-cli status
+# 应输出 "Connected"
 ```
 
 → `https://api.your-domain.com/api/health` 自动可用。
 
 ---
 
-## 3. Cloudflare 转发服务（你提到的部分）
+## 3. Cloudflare 在这套架构里做什么
 
-你打算在 Cloudflare 部署一个**转发服务**把流量打到 Adobe。这一节解释两种典型架构和注意点。
+你说过让 Cloudflare「转发请求」。在当前架构里 Cloudflare 只承担**出站**（去 Adobe）：
 
-### 3.1 架构 A：Cloudflare Worker 反向代理（推荐）
+```
+阿里云 ECS (容器内 curl_cffi) ──► Cloudflare WARP/Anycast ──► Adobe
+```
+
+- **不需要** CF Worker / CF Tunnel 入站代理（除非你额外加 WAF）
+- **不需要** Cloudflare 域名（除非你想用 CF 的 DDoS 防护）
+- Cloudflare 通过 **WARP 客户端** 在容器内提供出站代理
+
+下面 §3.1-§3.4 是你最初提到的可选方案（用 CF Worker 反向代理入站到 ECS），可以作为**额外**的安全层 / WAF 加上去。§4 才是国内 VPS 必走的 WARP 出站方案。
+
+### 3.1 可选：Cloudflare Tunnel / Worker 入站代理
+
+如果你想用 CF 的 WAF / DDoS 防护，可以再加一层：
+
+```
+国内用户 ─► Cloudflare Tunnel/Worker ─► ECS :19999
+```
+
+安装 cloudflared 到 ECS（不在容器内），建一个 Tunnel 把 `api.your-domain.com` 指向 `http://127.0.0.1:19999`：
+
+```bash
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+chmod +x cloudflared
+cloudflared tunnel login
+cloudflared tunnel create firefly
+cloudflared tunnel route dns firefly firefly.your-domain.com
+cloudflared tunnel run firefly
+# → https://firefly.your-domain.com
+```
+
+ECS 不需要开放 19999 给公网（CF Tunnel 自动建加密隧道）。
 
 ```
 前端 ─► Cloudflare Worker ─► 你的 VPS :19999 ─► curl_cffi ─► Adobe
@@ -330,33 +430,40 @@ cloudflared tunnel --hostname api.your-domain.com \
 
 ## 5. 端口汇总
 
-| 服务 | 端口 | 暴露？ |
-|------|------|--------|
-| `firefly-api`（容器内） | 19999 | **是**（docker-compose 已映射） |
-| 宿主机暴露 | 19999 | 建议只对 127.0.0.1 / CF Tunnel 开放 |
-| CF Tunnel | 443 出站 | 不需要入站公网 |
-| Cloudflare Worker | - | 无端口，由 CF edge 处理 |
+| 服务 | 端口 | 暴露？ | 说明 |
+|------|------|--------|------|
+| 容器 `app` 内 Nginx | **19999** | 是（公网） | 唯一入站：前端 + `/api/*` |
+| 容器 `app` 内 Gunicorn | 19998 | 否（仅 127.0.0.1） | Nginx 反代 |
+| 容器 `warp` | - | - | 出站到 CF 边缘 |
+| 宿主机 | 19999 | 阿里云安全组开放 | 直连 ECS 公网 IP |
+| CF Tunnel（可选入站） | 443 出站 | - | 不需要入站公网 |
 
 ---
 
 ## 6. 验证清单
 
-```powershell
-# 本地
+```bash
+# 本地 / ECS
 curl http://127.0.0.1:19999/api/health
 curl http://127.0.0.1:19999/api/models
+curl -I http://127.0.0.1:19999/                # 200 + text/html
+curl -I http://127.0.0.1:19999/assets/index-xxx.js  # 200 + immutable
 
-# 公网（VPS + Caddy）
-curl https://api.your-domain.com/api/health
+# 公网（直接连 ECS）
+curl http://your-ecs-ip:19999/api/health
 
-# Cloudflare Tunnel（VPS）
-curl https://api.your-domain.com/api/health
+# 域名 + Caddy（如果绑域名）
+curl https://firefly.your-domain.com/api/health
 
-# Worker 转发后（CF Worker）
-curl https://api-proxy.your-domain.com/api/health
+# CF Tunnel（可选入站代理）
+curl https://firefly.your-domain.com/api/health
+
+# WARP 出站验证
+docker compose exec warp warp-cli status
+docker compose exec app curl https://www.cloudflare.com/cdn-cgi/trace
 ```
 
-全部应返回 200 + `ok: true`。
+全部应返回 200 + `ok: true`。`cdn-cgi/trace` 的 `fl` 行尾应该是 CF 节点 IP（不是 ECS 的阿里云 IP）。
 
 ---
 
@@ -364,9 +471,13 @@ curl https://api-proxy.your-domain.com/api/health
 
 | 现象 | 原因 | 修复 |
 |------|------|------|
+| 访问 19999 是 `502 Bad Gateway` | gunicorn 没起来 | `docker compose logs app` 看错误 |
+| `/api/health` 返回 503 | `app` 容器还在启动 | 等 20s，或 `docker compose ps` 看 health |
 | `auth.token_ok=false` | `storage.json` / `current_token.json` 没注入 | 检查 `.env` 或 volume 挂载 |
-| Adobe 408 | 缺 curl_cffi 指纹 / 缺 arp | 镜像里 curl_cffi 已装；arp 由后端自动生成 |
+| Adobe 408 system under load | 缺 curl_cffi 指纹 / 缺 arp | 镜像里 curl_cffi 已装；arp 由后端自动生成 |
 | Adobe 401/403 | token 过期 | `python token_daemon.py --start` 重新登录 |
-| CORS 错误 | `CORS_ORIGINS` 没设前端域名 | docker-compose 里改成 `https://你的域名` |
+| Adobe 直连超时 | WARP 没起 / 没注册 | `docker compose exec warp warp-cli status`；首次需注册（容器内自动） |
+| `curl: (7) Failed to connect` 容器内到 Adobe | WARP 网络模式问题 | 检查 `network_mode: "service:warp"`；`warp` 健康检查是否通过 |
+| CORS 错误 | `CORS_ORIGINS` 没设前端域名 | 改 docker-compose 环境变量 |
 | 容器重启数据丢 | 没挂卷 | docker-compose 已配置 `./data:/data` |
-| CF Worker 408 | 标准 fetch 无指纹 | 改走架构 A（Worker → VPS → curl_cffi → Adobe） |
+| 静态资源 404 | 前端没 build / dist 缺 | `docker compose build --no-cache app` 强制重 build |
