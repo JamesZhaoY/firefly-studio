@@ -1,0 +1,68 @@
+name: Deploy frontend to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        env:
+          # Repo path on Pages: https://<user>.github.io/firefly-studio/
+          VITE_PAGES_BASE: /firefly-studio/
+          # Where the Flask API lives (set in repo Settings → Secrets → Actions).
+          # Leave empty for local-only demos; set to https://firefly-api.onrender.com
+          # when you deploy the backend.
+          VITE_API_BASE: ${{ secrets.VITE_API_BASE }}
+        run: npm run build
+
+      - name: Add .nojekyll
+        working-directory: frontend/dist
+        run: touch .nojekyll
+
+      - name: Copy SPA fallback
+        working-directory: frontend/dist
+        # GitHub Pages serves only static files; without server-side routing
+        # the app still works because our app is a single-page React shell
+        # that handles routes client-side.
+        run: cp index.html 404.html
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
