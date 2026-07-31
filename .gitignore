@@ -1,0 +1,39 @@
+﻿# Sensitive — never commit
+data/storage.json
+data/current_token.json
+data/oauth_token.json
+data/firefly.db
+data/firefly.db-*
+data/firefly.db-journal
+data/firefly.db-wal
+data/firefly.db-shm
+
+# Build outputs
+outputs/
+__pycache__/
+*.pyc
+*.pyo
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
