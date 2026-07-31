@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import traceback
@@ -28,10 +29,14 @@ from models_catalog import (
 
 APP_ROOT = Path(__file__).resolve().parent
 # FIREFLY_DATA_DIR 用于部署到 Render / Fly 等带持久化磁盘的运行时
-# （默认仍指向仓库根下的 data/，开发环境无变化）
-DATA_DIR = Path(os.environ.get("FIREFLY_DATA_DIR") or (APP_ROOT / "data"))
-OUT_DIR = APP_ROOT / "outputs"
+# 默认仍指向仓库根下的 data/，开发环境无变化
+_DATA_DIR_ENV = os.environ.get("FIREFLY_DATA_DIR")
+if _DATA_DIR_ENV:
+    DATA_DIR = Path(_DATA_DIR_ENV)
+else:
+    DATA_DIR = APP_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+OUT_DIR = APP_ROOT / "outputs"
 DB_PATH = DATA_DIR / "firefly.db"
 
 app = Flask(__name__)

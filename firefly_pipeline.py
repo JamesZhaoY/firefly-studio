@@ -40,7 +40,11 @@ from urllib.parse import urlparse
 import requests
 
 APP_ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("FIREFLY_DATA_DIR") or (APP_ROOT / "data"))
+_DATA_DIR_ENV = os.environ.get("FIREFLY_DATA_DIR")
+if _DATA_DIR_ENV:
+    DATA_DIR = Path(_DATA_DIR_ENV)
+else:
+    DATA_DIR = APP_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 OUT_DIR = APP_ROOT / "outputs"
 DEFAULT_STORAGE = DATA_DIR / "storage.json"

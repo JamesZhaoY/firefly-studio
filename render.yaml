@@ -8,7 +8,12 @@ services:
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
+    # Start command: copy secret files into the persistent data dir, then launch.
+    # Idempotent: re-running doesn't overwrite (cookie is fine to re-copy).
     startCommand: |
+      mkdir -p "$FIREFLY_DATA_DIR"
+      [ -f /etc/secrets/storage.json ] && cp -n /etc/secrets/storage.json "$FIREFLY_DATA_DIR/storage.json"
+      [ -f /etc/secrets/current_token.json ] && cp -n /etc/secrets/current_token.json "$FIREFLY_DATA_DIR/current_token.json"
       gunicorn -w 2 -k gthread --threads 4 \
         --timeout 600 \
         --bind 0.0.0.0:$PORT \
@@ -36,9 +41,6 @@ services:
         value: /var/data
 
     # Secret Files：先在本地导出 cookie/token，再上传到这里
-    # 文件名 → 磁盘路径映射
-    #   storage.json      → /etc/secrets/storage.json
-    #   current_token.json → /etc/secrets/current_token.json
     secretFiles:
       - filename: storage.json
         mountPath: /etc/secrets/storage.json
