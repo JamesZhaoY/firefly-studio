@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: firefly-api
+    runtime: python
+    plan: starter               # free tier lacks persistent disk; "starter" ($7/mo) gets 1GB
+    region: oregon
+    rootDir: .                  # repository root
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: |
+      gunicorn -w 2 -k gthread --threads 4 \
+        --timeout 600 \
+        --bind 0.0.0.0:$PORT \
+        wsgi:app
+
+    # 持久化磁盘（$1/GB·月，free tier 没有）
+    disk:
+      name: firefly-data
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      - key: FLASK_HOST
+        value: 0.0.0.0
+      - key: FLASK_PORT
+        value: 10000
+      - key: FLASK_DEBUG
+        value: "0"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: CORS_ORIGINS
+        value: "https://jameszhaoy.github.io"
+      # 数据目录指向持久化磁盘
+      - key: FIREFLY_DATA_DIR
+        value: /var/data
+
+    # Secret Files：先在本地导出 cookie/token，再上传到这里
+    # 文件名 → 磁盘路径映射
+    #   storage.json      → /etc/secrets/storage.json
+    #   current_token.json → /etc/secrets/current_token.json
+    secretFiles:
+      - filename: storage.json
+        mountPath: /etc/secrets/storage.json
+      - filename: current_token.json
+        mountPath: /etc/secrets/current_token.json
