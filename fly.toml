@@ -57,7 +57,6 @@ primary_region: nrt             # Tokyo (closest to China), change to ord / sin 
 # Secret files: pre-create locally, then `fly secrets import` to upload.
 # After `fly launch`, run:
 #   fly volumes create firefly_data --size 1 --region nrt
-#   fly secrets set --stage
-#     STORAGE_JSON="$(cat data/storage.json)"
-#     TOKEN_JSON="$(cat data/current_token.json)"
-# (config below consumes those secrets)
+#   fly secrets set STORAGE_JSON="$(cat data/storage.json)"
+#   fly secrets set TOKEN_JSON="$(cat data/current_token.json)"
+# Dockerfile CMD writes these env vars to /data/{storage,current_token}.json at boot.

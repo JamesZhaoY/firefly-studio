@@ -22,6 +22,11 @@ RUN mkdir -p /data
 
 EXPOSE 8080
 
-# Render uses $PORT; Fly sets PORT=8080. wsgi.py reads PORT.
-CMD ["gunicorn", "-w", "2", "-k", "gthread", "--threads", "4",
-     "--timeout", "600", "--bind", "0.0.0.0:8080", "wsgi:app"]
+# Entrypoint writes the Adobe credentials from env vars (set via `fly secrets set`)
+# into /data so app.py and firefly_pipeline.py find them at $FIREFLY_DATA_DIR.
+# Then exec gunicorn.
+CMD ["sh", "-c", "\
+  set -e; \
+  if [ -n \"$STORAGE_JSON\" ]; then printf '%s' \"$STORAGE_JSON\" > /data/storage.json; fi; \
+  if [ -n \"$TOKEN_JSON\" ]; then printf '%s' \"$TOKEN_JSON\" > /data/current_token.json; fi; \
+  exec gunicorn -w 2 -k gthread --threads 4 --timeout 600 --bind 0.0.0.0:8080 wsgi:app"]
