@@ -155,11 +155,82 @@ POST /api/generate
 
 ## 生产部署
 
-```bash
-cd frontend
-npm run build          # 产物在 frontend/dist
-# 把 dist 静态托管（nginx 等），反代 /api → 7860
+前后端拆开：前端 → GitHub Pages（已配 `.github/workflows/pages.yml`），后端 → Render。
+
+### 后端 → Render
+
+**1. 准备 Adobe 凭证**（在本地导出）：
+
+```powershell
+cd D:\workspace\app\adobe
+python token_daemon.py --start
+# 浏览器解 CAPTCHA 登录成功后，会写入 data/storage.json 和 data/current_token.json
 ```
+
+把这两个文件准备好（**不要 commit**）。
+
+**2. Render 创建服务**：
+
+| 字段 | 值 |
+|------|---|
+| Runtime | Python |
+| Branch | `master` |
+| Region | Oregon 或离你近的 |
+| Plan | **Starter ($7/mo)** — 需要 Persistent Disk（free tier 没有磁盘持久化，重启数据会丢） |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `gunicorn -w 2 -k gthread --threads 4 --timeout 600 --bind 0.0.0.0:$PORT wsgi:app` |
+| Health Check Path | `/api/health` |
+
+或选「Apply from YAML」→ 选 `render.yaml` 一键创建。
+
+**3. 加 Persistent Disk**（避免数据丢失）：
+
+- Settings → Disks → Add Disk
+  - Name: `firefly-data`
+  - Mount Path: `/var/data`
+  - Size: 1 GB（够用很久）
+- Environment → Add Env Var:
+  - `FIREFLY_DATA_DIR` = `/var/data`
+
+**4. 上传 Secret Files**（Adobe cookie + token）：
+
+- Secrets → Secret Files → Add:
+  - `storage.json`（内容 = 你的 `data/storage.json`）
+  - `current_token.json`（内容 = 你的 `data/current_token.json`）
+- Render 会挂到 `/etc/secrets/`，但**默认 `app.py` 不会读这些路径**
+
+`storage.json` 默认在 `$FIREFLY_DATA_DIR/storage.json`（即 `/var/data/storage.json`）。把 Secret Files 复制到磁盘：
+
+- 在 Render 控制台 → Shell 里执行：
+  ```bash
+  cp /etc/secrets/storage.json /var/data/storage.json
+  cp /etc/secrets/current_token.json /var/data/current_token.json
+  ```
+- 或在 Start Command 前加一行预拷贝。
+
+**5. 其它环境变量**：
+
+| 变量 | 值 |
+|------|---|
+| `FLASK_HOST` | `0.0.0.0` |
+| `FLASK_PORT` | `10000`（Render 自动设） |
+| `FLASK_DEBUG` | `0` |
+| `PYTHONUNBUFFERED` | `1` |
+| `CORS_ORIGINS` | `https://jameszhaoy.github.io` |
+
+**6. 触发部署**：Save → Render 自动 build + 启动。
+
+### 前端 → GitHub Pages
+
+已自动部署：https://jameszhaoy.github.io/firefly-studio/
+
+要让前端能调后端，加 Secret：
+
+- Repo → Settings → Secrets and variables → Actions → New repository secret
+  - Name: `VITE_API_BASE`
+  - Value: `https://firefly-api-xxxx.onrender.com`（你的 Render 域名）
+
+下次 push 自动重新 build 并生效。
 
 ---
 
