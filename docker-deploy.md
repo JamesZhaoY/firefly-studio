@@ -5,20 +5,23 @@
 ```
 浏览器 / GitHub Pages 前端
         │
-        │ HTTPS (CF proxy)
+        │ HTTPS (Cloudflare proxy)
         ▼
-Cloudflare（域名 + WAF + Tunnel）
+Cloudflare（域名 + WAF + Tunnel + WARP 出口）
         │
-        │ 反向代理到本机 / VPS
+        │ 反向代理到 VPS
         ▼
 Docker 容器（firefly-studio, :19999）
         │
-        │ curl_cffi 直连 / 或经 CF tunnel 出
+        │ curl_cffi  →  Cloudflare WARP 出口  →  Adobe
         ▼
 Adobe Firefly 3P（firefly.adobe.com / firefly-3p.ff.adobe.io / ims）
 ```
 
 后端端口：**19999**
+
+> **国内 VPS（阿里云、腾讯云）** → Adobe 直连被墙 / 限速。
+> 必须在容器里走 **Cloudflare WARP** 或等价方案才能稳定跑（详见 §3.5）。
 
 ---
 
@@ -219,28 +222,109 @@ export default {
 
 ---
 
-## 4. 让 Adobe 请求也走 Cloudflare（可选）
+## 4. 让 Adobe 请求走 Cloudflare（**国内 VPS 必看**）
 
-⚠️ **一般不需要**。curl_cffi 模拟 Chrome 指纹直连 Adobe 是最稳的。
+### 4.1 为什么需要
 
-但如果你在中国大陆、Adobe 直连慢/被墙，可以在容器里设代理：
+阿里云 / 腾讯云 / AWS 北京区等国内 VPS 出网到 Adobe 经常被墙或严重限速（`firefly.adobe.com` / `firefly-3p.ff.adobe.io` / `*.adobe.io` / `*.adobedc.net` 都在 ASN 旁路阻断列表里）。即便容器能跑起来，Adobe 接口也会超时或 408。
+
+### 4.2 方案：在容器里挂 Cloudflare WARP 客户端（推荐 · 免费）
+
+**原理**：WARP 是 Cloudflare 的零配置 VPN 客户端。装在容器里后，所有出站流量经 Cloudflare 边缘节点（全球 Anycast IP），等于从 Cloudflare 内网打 Adobe，**绕过国内 ISP 的 Adobe 阻断**。免费层无流量限制。
+
+### 4.3 实现（修改 docker-compose.yml）
+
+`docker-compose.yml` 加 WARP sidecar：
 
 ```yaml
-# docker-compose.yml
-environment:
-  # 假设你在 CF 起了个 Argo Tunnel 出公网
-  HTTPS_PROXY: "http://127.0.0.1:3128"   # 本地 cf-tunnel 出来的代理
+name: firefly-studio
+
+services:
+  api:
+    build: .
+    image: firefly-studio:latest
+    container_name: firefly-api
+    restart: unless-stopped
+    ports:
+      - "19999:19999"
+    volumes:
+      - ./data:/data
+      - ./outputs:/app/outputs
+    environment:
+      PORT: "19999"
+      CORS_ORIGINS: "https://your-frontend.example.com"
+      STORAGE_JSON: ""
+      TOKEN_JSON: ""
+    # WARP 把容器全部出站接进 CF 网络
+    network_mode: "service:warp"
+    depends_on:
+      warp:
+        condition: service_healthy
+
+  # Cloudflare WARP 客户端（基于 alpine）
+  warp:
+    image: caomingjun/warp:latest      # ~5MB，含 warp-cli
+    container_name: firefly-warp
+    restart: unless-stopped
+    # 把容器 DNS 设为 CF 的 1.1.1.1，避免国内 DNS 污染
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    # WARP 注册/启动（新设备走 registration）
+    command: >
+      sh -c "
+        if [ ! -f /var/lib/cloudflare-warp/reg.json ]; then
+          warp-cli registration new && echo 'y' | warp-cli registration license;
+        fi;
+        warp-cli connect;
+        sleep infinity
+      "
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
+    healthcheck:
+      test: ["CMD", "warp-cli", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  warp-data: {}
 ```
 
-或者直接修改 `firefly_pipeline.py` 让所有 outbound HTTP 走代理：
+> **关键：`api` 容器用 `network_mode: service:warp`**，所有流量都走 warp 容器的网络栈。
+> `curl_cffi` 完全不知道中间有代理 — 它发请求 → 流量自动从 warp 容器出去 → 经 CF 到 Adobe。
+> 完美保留 Chrome TLS 指纹（这是绕开 408 的核心）。
 
-```python
-# 顶部加（强制 requests 用代理）
-import os
-os.environ.setdefault("HTTPS_PROXY", "http://your-proxy:3128")
+### 4.4 验证 WARP 工作
+
+```bash
+docker compose exec warp warp-cli status
+# Connected to Cloudflare WARP+ ...
+
+docker compose exec api curl https://www.cloudflare.com/cdn-cgi/trace
+# 看 fl= 行最后 4 位 → 应是 CF 节点的 IP（不是阿里云 IP）
+
+docker compose exec api curl -I https://firefly-adobe-com.awsglobal.something
+# 直连测试 Adobe 域名能访问
 ```
 
-⚠️ 注意：curl_cffi 自己处理 TLS，可能不读这个 env。要在 `_make_client()` 里给 `CurlSession(impersonate=..., proxy=proxy_url)` 传 proxy 参数。
+### 4.5 替代方案：CF Tunnel 反向出栈
+
+不想用 WARP，也可以让容器出口走 **Cloudflare Tunnel**，但需要写一个 `cloudflared` 配置把 Adobe 的 SNI 代理出去：
+
+```bash
+# cloudflared 在 VPS 上跑（不在容器内）
+cloudflared tunnel --hostname api.your-domain.com \
+    --url http://localhost:19999
+# 再在容器里设 HTTPS_PROXY=http://127.0.0.1:PORT
+```
+
+比 WARP 复杂，且对 curl_cffi 不友好。**不推荐**。
+
+### 4.6 替代方案：第三方 Adobe 镜像（极不推荐）
+
+有人说走 `azure-sora` / `fal-veo` 等三方模型替代 Firefly 3P，**但你用的是 Adobe IMS 账号**，绕不开 Adobe 直连。这条路不可行。
 
 ---
 
