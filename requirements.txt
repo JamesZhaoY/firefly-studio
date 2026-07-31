@@ -1,10 +1,5 @@
 requests>=2.31.0
 curl_cffi>=0.7.0
+playwright>=1.40.0
 flask>=3.0.0
 flask-cors>=4.0.0
-gunicorn>=21.2.0
-
-# playwright 仅本地 token_daemon.py 需要；Render 跑后端时不需要它
-# 留作可选依赖（首次登录时可在本地跑 token_daemon.py，把 data/storage.json
-# 上传到 Render 的 Secret Files）
-# playwright>=1.40.0

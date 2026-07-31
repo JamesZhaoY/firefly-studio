@@ -155,62 +155,15 @@ POST /api/generate
 
 ## 生产部署
 
-前后端拆开：前端 → GitHub Pages（已配 `.github/workflows/pages.yml`），后端 → Render / Fly.io 二选一。
-
-### 选项 A：后端 → Render（$7/月 Starter 计划）
-
-> Free tier **不能用**：没有持久磁盘，SQLite + cookie 重启就丢。
-
-`render.yaml` 已写好。Render 控制台 → New → Blueprint → 指 `render.yaml`。或手动：
-
-| 字段 | 值 |
-|------|---|
-| Plan | Starter ($7/mo) |
-| Build Command | `pip install -r requirements.txt` |
-| Start Command | 见 `render.yaml`（自动拷 secret 文件到 data dir 后启 gunicorn） |
-| Health Check Path | `/api/health` |
-
-环境变量已在 `render.yaml` 里。Secret Files 上传：
-
-- `storage.json`（内容 = 本地 `data/storage.json` 全文）
-- `current_token.json`（内容 = 本地 `data/current_token.json` 全文）
-
-Disks → Add：`firefly-data` / `/var/data` / 1GB。
-
-### 选项 B：后端 → Fly.io（**真免费**，1GB 持久卷）
-
-`fly.toml` + `Dockerfile` + `fly-setup.md` 已写好。
-
-```bash
-# 安装 flyctl: https://fly.io/docs/flyctl/install/
-fly auth signup          # 不需要信用卡
-cd D:\workspace\app\adobe
-fly launch --no-deploy   # 创建 app，复制 fly.toml
-fly volumes create firefly_data --size 1 --region nrt
-fly secrets set STORAGE_JSON="$(cat data/storage.json)"
-fly secrets set TOKEN_JSON="$(cat data/current_token.json)"
-fly deploy
-```
-
-> Free 计划允许 1 个 shared-cpu-1x VM（256MB），1GB 卷。sleep on idle 不收费。
-
-### 前端 → GitHub Pages
-
-已自动部署：https://jameszhaoy.github.io/firefly-studio/
-
-要让前端连后端：
-
-- Repo → Settings → Secrets and variables → Actions → New secret:
-  - `VITE_API_BASE` = `https://firefly-api-xxxx.onrender.com`（或 Fly 给的 `https://firefly-studio.fly.dev`）
-
-下次 push 自动重新 build 并生效。
+本项目只在本地运行：前端 `python app.py` + `cd frontend && npm run dev`，全部 127.0.0.1 访问。
 
 ---
 
 ## 常见问题
 
 - **NameError: name 'os' is not defined**：`app.py` 漏 `import os`。已在 master 修。
-- **Render 没有 disk 目录**：free tier 没有磁盘。改用 Starter $7/月 或 Fly.io 免费。
+- **CORS 跨域**：默认 `*`。生产可设环境变量 `CORS_ORIGINS=https://your-frontend.example`。
+- **curl_cffi 没装**：TLS 指纹不像浏览器，会触发 408。`pip install curl_cffi`。
 
 - **408 system under load**：token client_id 与 `x-api-key` 不匹配 / 缺 `x-arp-session-id` / 没装 `curl_cffi` 等。本仓库默认选 token 文件里的 client_id 并自动生成 base64 arp。
 - **额度耗尽**：上游返回 `401/403` + header `x-access-error=taste_exhausted`，前端会显示对应文案。

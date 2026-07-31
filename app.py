@@ -28,20 +28,13 @@ from models_catalog import (
 )
 
 APP_ROOT = Path(__file__).resolve().parent
-# FIREFLY_DATA_DIR 用于部署到 Render / Fly 等带持久化磁盘的运行时
-# 默认仍指向仓库根下的 data/，开发环境无变化
-_DATA_DIR_ENV = os.environ.get("FIREFLY_DATA_DIR")
-if _DATA_DIR_ENV:
-    DATA_DIR = Path(_DATA_DIR_ENV)
-else:
-    DATA_DIR = APP_ROOT / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = APP_ROOT / "data"
 OUT_DIR = APP_ROOT / "outputs"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "firefly.db"
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
-# 生产收紧 CORS（默认仍 * 便于本地调试）
 _cors_origins = os.environ.get("CORS_ORIGINS", "*")
 CORS(app, resources={r"/api/*": {"origins": _cors_origins.split(",") if _cors_origins != "*" else "*"}})
 
