@@ -9,12 +9,16 @@ export default defineConfig({
   plugins: [react()],
   base: pagesBase,
   server: {
+    host: '0.0.0.0',
     port: 5173,
+    strictPort: true,
+    // 允许 LAN / 任意 host 访问, 方便手机调试
+    allowedHosts: true,
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:7860',
         changeOrigin: true,
-      },
+      }
     },
   },
   build: {

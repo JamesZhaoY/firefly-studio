@@ -359,6 +359,64 @@ def safe_name(text: str, limit: int = 48) -> str:
     return s or "output"
 
 
+# Map raw upstream errors into short user-facing messages.
+# Reason: keep the front-end from leaking internal JSON / request IDs.
+_USER_ERROR_RULES: list[tuple[str, str]] = [
+    ("copyright", "生成的内容可能涉及版权限制,请改写提示词或更换模型。"),
+    ("safety", "生成请求被安全策略拦截,请调整提示词。"),
+    ("moderation", "提示词触发了审核,请换一种描述。"),
+    ("policy", "请求不符合上游策略,请调整参数。"),
+    ("audio", "音频部分触发限制,可在参数面板关闭「音频」后重试。"),
+    ("seedance", "Seedance 拒绝了任务,可尝试切换视频模型或关闭音频。"),
+    ("veo", "Veo 拒绝了任务,可稍后重试或切换其他视频模型。"),
+    ("kling", "可灵拒绝了任务,请调整提示词或更换视频模型。"),
+    ("rate", "上游限流,请稍后重试。"),
+    ("quota", "上游额度已用完,请稍后再试。"),
+    ("credit", "账户余额不足,请先充值。"),
+    ("expired", "登录状态已过期,请重新运行 token_daemon.py --start。"),
+    ("鉴权", "登录状态已过期,请重新运行 token_daemon.py --start。"),
+    ("auth", "登录状态已过期,请重新运行 token_daemon.py --start。"),
+    ("unauthorized", "登录状态已过期,请重新运行 token_daemon.py --start。"),
+    ("timeout", "请求超时,可重试或调高 max_wait。"),
+    ("network", "网络异常,请检查本地代理或重试。"),
+    ("not found", "该模型在当前账号下不可用,请更换模型。"),
+]
+
+
+def summarize_upstream_error(payload: Any) -> str:
+    """把上游 / 调度失败归一化成一行用户文案。
+
+    输入可能是 dict / str / 任意 JSON。前端只展示这行字符串,完整原始数据
+    通过 task_failed / task_traceback 日志保留,运维可在日志页查看。
+    """
+    blob = ""
+    if isinstance(payload, dict):
+        for key in ("message", "error", "exception", "reason", "msg"):
+            v = payload.get(key)
+            if isinstance(v, str) and v.strip():
+                blob = v
+                break
+        if not blob:
+            blob = json.dumps(payload, ensure_ascii=False)
+    elif isinstance(payload, str):
+        blob = payload
+    elif payload is not None:
+        blob = str(payload)
+
+    lower = blob.lower()
+    for needle, message in _USER_ERROR_RULES:
+        if needle in lower:
+            return message
+
+    if any(s in blob for s in ("401", "403")) or "登录" in blob:
+        return "登录状态已过期,请重新运行 token_daemon.py --start。"
+    if "408" in blob or "超时" in blob:
+        return "请求超时,请稍后重试。"
+    if any(s in blob for s in ("500", "502", "503", "504")):
+        return "上游服务暂时不可用,请稍后重试。"
+    return "生成失败,请稍后重试或在日志页查看详情。"
+
+
 def new_seed() -> int:
     return random.randint(1, 2_147_483_647)
 
@@ -494,7 +552,7 @@ class FireflyClient:
                     )
                     time.sleep(delay)
                     continue
-                raise RuntimeError(f"{label} 网络失败: {e}") from e
+                raise RuntimeError(summarize_upstream_error({"message": "网络失败"})) from e
 
             if r.status_code < 400:
                 return r
@@ -503,13 +561,10 @@ class FireflyClient:
             if r.status_code in (401, 403):
                 access_err = r.headers.get("x-access-error") or ""
                 if access_err == "taste_exhausted":
-                    raise RuntimeError(
-                        f"{label} 额度耗尽 (x-access-error=taste_exhausted)"
-                    )
-                raise RuntimeError(
-                    f"{label} 鉴权失败 HTTP {r.status_code}"
-                    f"{f' ({access_err})' if access_err else ''}: {r.text[:300]}"
-                )
+                    raise RuntimeError(summarize_upstream_error({"message": "quota exhausted"}))
+                if label == "视频提交":
+                    raise RuntimeError("视频请求被 Adobe 拒绝（403）；请检查视频模型权限和 Firefly 登录会话。")
+                raise RuntimeError(summarize_upstream_error({"message": f"{label} 鉴权失败"}))
 
             is_408 = r.status_code == 408
             is_soft = r.status_code in soft_retryable
@@ -539,19 +594,15 @@ class FireflyClient:
                 continue
 
             if is_408:
-                hint = (
-                    "持续 408 不是真负载。clio-playground-web token 必须带 "
-                    "x-arp-session-id=base64({sid,ftr})，且 x-api-key/origin 与 JWT client_id 一致。"
-                    " projectx_webapp 用 origin=new.express.adobe.com；"
-                    " clio 用 origin=https://firefly.adobe.com。不要把 Cookie 带到 generate。"
-                )
                 raise RuntimeError(
-                    f"{label} HTTP 408: {last_408_body or r.text[:300]}\n[提示] {hint}"
+                    summarize_upstream_error({"message": "持续 408"})
                 )
 
-            raise RuntimeError(f"{label} HTTP {r.status_code}: {r.text[:500]}")
+            raise RuntimeError(
+                summarize_upstream_error({"message": f"{label} HTTP {r.status_code}"})
+            )
 
-        raise RuntimeError(f"{label} 重试 {max_retries} 次后仍失败: {last_err}")
+        raise RuntimeError(summarize_upstream_error({"message": "重试多次后仍失败"}))
 
     def list_models(self, include_first_party: bool = True) -> list[dict[str, Any]]:
         print("[1/4] 查询模型清单...")
@@ -730,7 +781,7 @@ class FireflyClient:
                 task_id = parts[-1]
         if not task_id:
             raise RuntimeError(
-                f"{kind} 未返回 taskId: {json.dumps(data, ensure_ascii=False)[:500]}"
+                summarize_upstream_error({"message": f"{kind} 上游未返回任务 ID"})
             )
         print(f"[OK] {kind} taskId={task_id}")
         if poll_url:
@@ -789,15 +840,15 @@ class FireflyClient:
                 url, headers=self._headers(), params=params, timeout=timeout
             )
             if r.status_code in (401, 403):
-                raise RuntimeError(f"查询鉴权失败 HTTP {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(summarize_upstream_error({"message": "查询鉴权失败"}))
             if r.status_code >= 400:
-                raise RuntimeError(f"查询失败 HTTP {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(summarize_upstream_error({"message": f"查询失败 HTTP {r.status_code}"}))
             try:
                 data = r.json()
             except ValueError:
                 data = {"raw": r.text[:400]}
             status_header = str(r.headers.get("x-task-status") or "").lower()
-            status = self._status_of(data) or status_header
+            status = self._status_str(data) or status_header
             progress = (
                 data.get("progress")
                 or (data.get("result") or {}).get("progress")
@@ -809,36 +860,85 @@ class FireflyClient:
                 print(f"      {line}")
                 last = line
             # adobe2api: 有 outputs 即完成
-            outputs = data.get("outputs") if isinstance(data, dict) else None
+            outputs = self._extract_outputs(data)
             if outputs:
                 return data
             if self._is_done(status):
+                # 状态已 succeeded, 但 outputs 尚未填充, 再等一轮避免空结果。
+                if elapsed + interval <= max_wait:
+                    time.sleep(interval)
+                    continue
                 return data
             if self._is_failed(status):
-                raise RuntimeError(f"任务失败: {json.dumps(data, ensure_ascii=False)[:600]}")
+                user_msg = summarize_upstream_error(data) or "生成失败"
+                raise RuntimeError(user_msg)
             time.sleep(interval)
 
-    @staticmethod
-    def _status_of(data: dict[str, Any]) -> str:
+    # Adobe / Firefly status_code 数值约定:
+    # 0 pending, 1 queued, 2 running, 3 succeeded, 4 failed, 5 cancelled.
+    _STATUS_CODE_MAP: dict[int, str] = {
+        0: "pending",
+        1: "queued",
+        2: "running",
+        3: "succeeded",
+        4: "failed",
+        5: "cancelled",
+        6: "expired",
+    }
+    _DONE_KEYWORDS = ("succeeded", "success", "completed", "complete", "done", "finished")
+    _FAILED_KEYWORDS = ("failed", "error", "expired", "cancelled", "canceled", "rejected")
+
+    @classmethod
+    def _status_str(cls, data: dict[str, Any]) -> str:
+        """归一化任务状态。Adobe 响应同时支持字符串与整数 status_code。"""
         for k in ("status", "state", "jobStatus"):
             v = data.get(k)
-            if v:
-                return str(v).lower()
+            if isinstance(v, str) and v.strip():
+                return v.lower()
+        code = data.get("status_code")
+        mapped = cls._numeric_status(code)
+        if mapped:
+            return mapped
         r = data.get("result") or {}
         if isinstance(r, dict):
             for k in ("status", "state"):
                 v = r.get(k)
-                if v:
-                    return str(v).lower()
+                if isinstance(v, str) and v.strip():
+                    return v.lower()
+            mapped = cls._numeric_status(r.get("status_code"))
+            if mapped:
+                return mapped
         return ""
 
-    @staticmethod
-    def _is_done(status: str) -> bool:
-        return status in ("succeeded", "success", "completed", "complete", "done", "finished")
+    @classmethod
+    def _numeric_status(cls, code: Any) -> str:
+        if isinstance(code, bool):
+            return ""
+        if isinstance(code, int):
+            return cls._STATUS_CODE_MAP.get(code, f"code_{code}")
+        if isinstance(code, str) and code.strip().isdigit():
+            return cls._STATUS_CODE_MAP.get(int(code.strip()), f"code_{code}")
+        return ""
+
+    @classmethod
+    def _is_done(cls, status: str) -> bool:
+        return status in cls._DONE_KEYWORDS
+
+    @classmethod
+    def _is_failed(cls, status: str) -> bool:
+        return status in cls._FAILED_KEYWORDS
 
     @staticmethod
-    def _is_failed(status: str) -> bool:
-        return status in ("failed", "error", "expired", "cancelled", "canceled", "rejected")
+    def _extract_outputs(data: dict[str, Any]) -> list[Any] | None:
+        outputs = data.get("outputs") if isinstance(data, dict) else None
+        if outputs:
+            return outputs
+        r = data.get("result") if isinstance(data, dict) else None
+        if isinstance(r, dict):
+            nested = r.get("outputs")
+            if nested:
+                return nested
+        return None
 
     def collect_outputs(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         urls: list[str] = []
@@ -871,7 +971,7 @@ class FireflyClient:
         uniq_blobs = [b for b in blobs if not (b in seen_b or seen_b.add(b))]
         if not uniq_urls and not uniq_blobs:
             raise RuntimeError(
-                f"完成但未解析到产物: {json.dumps(data, ensure_ascii=False)[:600]}"
+                summarize_upstream_error({"message": "完成但未返回可下载的产物"})
             )
         return [{"url": u} for u in uniq_urls] + [{"blob": b} for b in uniq_blobs]
 

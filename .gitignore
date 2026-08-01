@@ -41,3 +41,10 @@ outputs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Local Python env / Playwright cache
+.venv/
+.venv-*/
+.playwright-mcp/
+/private/tmp/firefly-studio-api.log
+.DS_Store

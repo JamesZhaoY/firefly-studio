@@ -35,4 +35,8 @@ export const api = {
   },
   clearLogs: () => request('/api/logs', { method: 'DELETE' }),
   clearChat: () => request('/api/chat/clear', { method: 'POST' }),
+  videoGenerate: (body) =>
+    request('/api/video/generate', { method: 'POST', body: JSON.stringify(body) }),
+  videoJob: (id) => request(`/api/video/${id}`),
+  voices: () => request('/api/voices'),
 }

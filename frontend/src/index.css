@@ -1,56 +1,7 @@
-/* Reset + base tokens. Anti-default: warm amber accent over neutral zinc.
-   No gradient mesh. No glow. No purple. No pure black. */
-:root {
-  --bg: #0E1014;
-  --bg-2: #14171D;
-  --bg-3: #1A1E26;
-  --line: #252A33;
-  --line-2: #2E343F;
-  --fg: #E7EAEF;
-  --fg-2: #B0B7C2;
-  --fg-3: #6E7684;
-  --accent: #E8A24B;
-  --accent-fg: #1A1106;
-  --accent-soft: #E8A24B22;
-  --ok: #6FBE8E;
-  --warn: #D4B266;
-  --err: #E07781;
-  --radius: 8px;
-  --radius-sm: 6px;
-  --radius-lg: 10px;
-  --mono: 'Geist Mono', ui-monospace, 'JetBrains Mono', Consolas, monospace;
-  --sans: 'Geist Sans', 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI',
-          'PingFang SC', 'Microsoft YaHei', sans-serif;
-  font-family: var(--sans);
-  color-scheme: dark;
-}
-
-[data-theme='light'] {
-  --bg: #FAFAF7;
-  --bg-2: #FFFFFF;
-  --bg-3: #F2F1EC;
-  --line: #E5E2D8;
-  --line-2: #D5D2C8;
-  --fg: #14171C;
-  --fg-2: #4D525B;
-  --fg-3: #8A8E96;
-  --accent: #B6762A;
-  --accent-fg: #FFFFFF;
-  --accent-soft: #B6762A18;
-  --ok: #388F5F;
-  --warn: #9E7A2A;
-  --err: #B04650;
-  color-scheme: light;
-}
-
-* { box-sizing: border-box; }
-html, body, #root { margin: 0; min-height: 100%; background: var(--bg); color: var(--fg); }
-body { font-family: var(--sans); -webkit-font-smoothing: antialiased; font-size: 14px; line-height: 1.45; }
-button { font-family: inherit; }
-input, select, textarea { font-family: inherit; color: inherit; }
-
-::selection { background: var(--accent); color: var(--accent-fg); }
-
-@media (prefers-reduced-motion: reduce) {
-  * { animation: none !important; transition: none !important; }
-}
+@import '@fontsource/geist-sans/400.css';
+@import '@fontsource/geist-sans/500.css';
+@import '@fontsource/geist-sans/600.css';
+@import '@fontsource/geist-mono/400.css';
+@import '@fontsource/geist-mono/500.css';
+@import './tokens.css';
+@import './base.css';

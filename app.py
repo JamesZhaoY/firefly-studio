@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import sys
 import traceback
 import uuid
 from pathlib import Path
@@ -17,8 +18,10 @@ from typing import Any
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+import requests
 
 import firefly_pipeline as fp
+import video_pipeline as vp
 from db import Database
 from models_catalog import (
     IMAGE_MODELS,
@@ -41,10 +44,9 @@ CORS(app, resources={r"/api/*": {"origins": _cors_origins.split(",") if _cors_or
 db = Database(DB_PATH)
 _executor_sema = threading.Semaphore(2)
 _models_cache: dict[str, Any] = {"ts": 0.0, "data": None, "error": ""}
-
+_credits_cache: dict[str, Any] = {"ts": 0.0, "data": {}}
 
 # ── models cache ─────────────────────────────────────────────
-
 
 def _latest_flat_path() -> Path | None:
     files = sorted(
@@ -53,7 +55,6 @@ def _latest_flat_path() -> Path | None:
         reverse=True,
     )
     return files[0] if files else None
-
 
 def _load_flat_from_disk() -> list[dict[str, Any]] | None:
     import json
@@ -80,7 +81,6 @@ def _load_flat_from_disk() -> list[dict[str, Any]] | None:
         return None
     return None
 
-
 def _save_flat_to_disk(flat: list[dict[str, Any]], families: list | None = None) -> None:
     import json
     from datetime import datetime
@@ -94,7 +94,6 @@ def _save_flat_to_disk(flat: list[dict[str, Any]], families: list | None = None)
         (OUT_DIR / f"models_{stamp}.json").write_text(
             json.dumps(families, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-
 
 def _fetch_live_models() -> list[dict[str, Any]]:
     token, extras = fp.require_token()
@@ -111,7 +110,6 @@ def _fetch_live_models() -> list[dict[str, Any]]:
     except Exception:
         pass
     return flat
-
 
 def _get_models_by_kind(*, force_live: bool = False) -> tuple[dict[str, list], str, str]:
     now = time.time()
@@ -152,7 +150,6 @@ def _get_models_by_kind(*, force_live: bool = False) -> tuple[dict[str, list], s
     _models_cache["error"] = err
     return by_kind, source, err
 
-
 def _auth_status() -> dict[str, Any]:
     storage = Path(fp.env("FIREFLY_STORAGE", str(fp.DEFAULT_STORAGE)))
     token_file = Path(fp.env("FIREFLY_TOKEN_FILE", str(fp.DEFAULT_TOKEN_FILE)))
@@ -186,6 +183,49 @@ def _auth_status() -> dict[str, Any]:
         info["client_id"] = claims.get("client_id") or ""
     return info
 
+
+def _credits_status() -> dict[str, Any]:
+    now = time.time()
+    cached = _credits_cache.get("data") or {}
+    if now - float(_credits_cache.get("ts") or 0) < 30:
+        return cached
+    try:
+        token, _ = fp.require_token()
+        claims = fp.decode_jwt_payload(token)
+        account_id = str(
+            claims.get("user_id") or claims.get("aa_id") or claims.get("sub") or ""
+        ).strip()
+        if not account_id:
+            raise RuntimeError("token 未包含账户 ID")
+        response = requests.get(
+            "https://firefly.adobe.io/v1/credits/balance",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "x-api-key": "SunbreakWebUI1",
+                "x-account-id": account_id,
+                "Origin": "https://new.express.adobe.com",
+                "Referer": "https://new.express.adobe.com/",
+                "Accept": "application/json",
+            },
+            timeout=20,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Adobe 返回 HTTP {response.status_code}")
+        payload = response.json()
+        total_info = payload.get("total") if isinstance(payload, dict) else {}
+        quota = total_info.get("quota") if isinstance(total_info, dict) else {}
+        data = {
+            "total": quota.get("total"),
+            "used": quota.get("used"),
+            "available": quota.get("available"),
+            "available_until": total_info.get("availableUntil"),
+            "updated_at": now,
+            "error": "",
+        }
+    except Exception as e:
+        data = {"error": str(e), "updated_at": now}
+    _credits_cache.update(ts=now, data=data)
+    return data
 
 def _public_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
     if not job:
@@ -221,9 +261,7 @@ def _public_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
     out["outputs"] = job.get("outputs") or []
     return out
 
-
 # ── job runner ───────────────────────────────────────────────
-
 
 def _run_job(job_id: str) -> None:
     with _executor_sema:
@@ -370,21 +408,22 @@ def _run_job(job_id: str) -> None:
         except Exception as e:
             tb = traceback.format_exc()
             err_msg = str(e)
+            user_msg = fp.summarize_upstream_error(err_msg)
+            # 完整堆栈只打印到服务器 stderr, 不写进任何用户可见字段。
+            sys.stderr.write(f"[JOB FAILED] {job_id} ({kind}) {type(e).__name__}: {err_msg}\n")
+            traceback.print_exc(file=sys.stderr)
             db.update_job(
                 job_id,
                 status="failed",
-                message=err_msg[:500],
-                error=err_msg[:1000],
-                traceback=tb,
+                message=user_msg,
                 progress=100,
                 finished_at=time.time(),
             )
             # ── (3b) 创建失败：异常原因 ─────────────────────────
-            # 如果上游给过 task_id 仍失败，附带上下文
-            failure_context = {
-                "exception": err_msg,
-                "exception_type": type(e).__name__,
-                "submitted": submitted if submitted.get("ok") else {},
+            # 仅写归一化文案 + 异常类型名, 不暴露原始堆栈或 task_id 详情。
+            log_payload = {
+                "user_message": user_msg,
+                "error_type": type(e).__name__,
             }
             db.add_log(
                 job_id=job_id,
@@ -392,24 +431,26 @@ def _run_job(job_id: str) -> None:
                 method="INTERNAL",
                 url=f"generate/{kind}",
                 status_code=500,
-                error=err_msg,
-                response_body=failure_context,
+                error=user_msg,
+                response_body=log_payload,
                 duration_ms=(time.time() - t0) * 1000,
             )
-            # 失败时也落一份完整 traceback 到单独日志行，便于排错
-            db.add_log(
-                job_id=job_id,
-                phase="task_traceback",
-                method="INTERNAL",
-                url=f"generate/{kind}",
-                status_code=500,
-                response_body=tb[-4000:],
-                duration_ms=(time.time() - t0) * 1000,
-            )
-
+            # 完整堆栈只打印到服务器 stderr, 不再落 DB, 避免在日志页泄露内部错误信息。
+            # 运维调试请看 /tmp/firefly-studio-api.log。
 
 # ── routes ───────────────────────────────────────────────────
 
+@app.get("/outputs/<path:filename>")
+def api_outputs(filename: str):
+    """从 outputs/ 目录读取文件（成片 / TTS / 关键帧）。"""
+    from flask import send_from_directory, abort
+    base = OUT_DIR.resolve()
+    target = (base / filename).resolve()
+    if not str(target).startswith(str(base)):
+        abort(404)
+    if not target.exists() or not target.is_file():
+        abort(404)
+    return send_from_directory(base, filename, conditional=True)
 
 @app.get("/api/health")
 def api_health():
@@ -417,11 +458,11 @@ def api_health():
         {
             "ok": True,
             "auth": _auth_status(),
+            "credits": _credits_status(),
             "time": time.time(),
             "db": str(DB_PATH),
         }
     )
-
 
 @app.get("/api/models")
 def api_models():
@@ -463,7 +504,6 @@ def api_models():
             "total": sum(len(v) for v in by_kind.values()),
         }
     )
-
 
 @app.post("/api/generate")
 def api_generate():
@@ -535,14 +575,12 @@ def api_generate():
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
     return jsonify({"job_id": job_id, "job": _public_job(job)}), 202
 
-
 @app.get("/api/jobs")
 def api_jobs():
     limit = int(request.args.get("limit") or 50)
     offset = int(request.args.get("offset") or 0)
     items = db.list_jobs(limit=limit, offset=offset)
     return jsonify({"jobs": [_public_job(j) for j in items], "count": len(items)})
-
 
 @app.get("/api/jobs/<job_id>")
 def api_job(job_id: str):
@@ -551,14 +589,12 @@ def api_job(job_id: str):
         return jsonify({"error": "job not found"}), 404
     return jsonify({"job": _public_job(job)})
 
-
 @app.delete("/api/jobs/<job_id>")
 def api_job_delete(job_id: str):
     ok = db.delete_job(job_id)
     if not ok:
         return jsonify({"error": "job not found"}), 404
     return jsonify({"ok": True})
-
 
 @app.get("/api/logs")
 def api_logs():
@@ -568,13 +604,11 @@ def api_logs():
     items = db.list_logs(job_id=job_id, limit=limit, offset=offset)
     return jsonify({"logs": items, "count": len(items)})
 
-
 @app.delete("/api/logs")
 def api_logs_clear():
     """清空所有调用日志（不影响 jobs 表）。"""
     deleted = db.clear_all_logs()
     return jsonify({"ok": True, "deleted": deleted})
-
 
 @app.post("/api/chat/clear")
 def api_chat_clear():
@@ -585,6 +619,253 @@ def api_chat_clear():
     deleted = db.clear_all_jobs()
     return jsonify({"ok": True, "deleted": deleted})
 
+@app.get("/api/voices")
+def api_voices():
+    """列出外部 TTS 可用人声；上游失败 → 兜底常用语音列表。"""
+    try:
+        client = vp.TTSClient()
+        voices = client.list_voices()
+    except Exception:
+        voices = []
+    if not voices:
+        voices = [
+            {"ShortName": vp.TTS_DEFAULT_VOICE, "Gender": "Female", "Locale": "zh-CN"},
+            {"ShortName": vp.TTS_FALLBACK_VOICE, "Gender": "Female", "Locale": "en-US"},
+            {"ShortName": "zh-CN-YunxiNeural", "Gender": "Male", "Locale": "zh-CN"},
+            {"ShortName": "en-US-GuyNeural", "Gender": "Male", "Locale": "en-US"},
+        ]
+    # 精简字段，省字节
+    slim = [
+        {
+            "id": v.get("ShortName") or v.get("id") or "",
+            "name": v.get("FriendlyName") or v.get("Name") or "",
+            "gender": v.get("Gender") or "",
+            "locale": v.get("Locale") or "",
+        }
+        for v in voices
+        if (v.get("ShortName") or v.get("id"))
+    ]
+    return jsonify({"voices": slim, "count": len(slim), "source": "edge" if voices else "preset"})
+
+def _run_video_job(job_id: str) -> None:
+    """后台跑 video_pipeline.generate_full_video，并把结果写回 SQLite。"""
+    with _executor_sema:
+        job = db.get_job(job_id) or {}
+        params = job.get("params") or {}
+        prompt = str(params.get("prompt") or "").strip()
+        if not prompt:
+            db.update_job(job_id, status="failed", message="prompt 不能为空", progress=100, finished_at=time.time())
+            return
+        db.update_job(job_id, status="running", message="规划分镜中…", progress=5)
+
+        def _on_progress(pct: float, msg: str) -> None:
+            try:
+                db.update_job(
+                    job_id,
+                    status="running",
+                    message=msg,
+                    progress=max(5.0, min(float(pct), 100.0)),
+                )
+            except Exception:
+                pass
+
+        def _on_state(shots: list[dict[str, Any]], msg: str) -> None:
+            try:
+                db.update_job(
+                    job_id,
+                    status="running",
+                    message=msg,
+                    result={"shots": shots},
+                )
+                db.add_log(
+                    job_id=job_id,
+                    phase="video_progress",
+                    method="INTERNAL",
+                    url="video_pipeline",
+                    status_code=0,
+                    response_body={"message": msg, "shots": shots},
+                )
+            except Exception:
+                pass
+
+        t0 = time.time()
+        try:
+            db.add_log(
+                job_id=job_id, phase="video_request",
+                method="INTERNAL", url="video_pipeline",
+                status_code=0, request_body={"prompt": prompt, "options": params.get("options") or {}},
+            )
+            result = vp.generate_full_video(
+                prompt,
+                options_dict=params.get("options") or {},
+                on_progress=_on_progress,
+                on_state=_on_state,
+                job_id=job_id,
+            )
+            shots = result.get("shots") or []
+            # 把分镜 URL 也作为 outputs 暴露，前端现有 video 预览逻辑就能用
+            outputs: list[dict[str, Any]] = []
+            for s in shots:
+                if s.get("video_url"):
+                    outputs.append({
+                        "type": "video",
+                        "url": s["video_url"],
+                        "ext": ".mp4",
+                        "label": f"分镜 {s.get('index')}",
+                    })
+                if s.get("image_url"):
+                    outputs.append({
+                        "type": "image",
+                        "url": s["image_url"],
+                        "ext": ".jpg",
+                        "label": f"分镜 {s.get('index')} 关键帧",
+                    })
+            final_path = result.get("final_video_path") or ""
+            if final_path:
+                # 本地文件：暴露为 /outputs/videos/<job>/final.mp4；前端 video 标签能直接播
+                rel = final_path.split("/outputs/", 1)[-1] if "/outputs/" in final_path else ""
+                if rel:
+                    outputs.append({
+                        "type": "video",
+                        "url": f"/outputs/{rel}",
+                        "ext": ".mp4",
+                        "label": "成片",
+                        "local": True,
+                    })
+
+            errs = result.get("errors") or []
+            status = "succeeded" if final_path else ("failed" if not shots else "succeeded")
+            message = (
+                f"完成 {len(shots)} 个分镜"
+                + (f"，{round(result.get('ffprobe_duration_total') or 0, 1)}s" if final_path else "")
+                + (f"（部分失败：{len(errs)} 项）" if errs else "")
+            )
+            db.update_job(
+                job_id,
+                status=status,
+                message=message,
+                progress=100,
+                outputs=outputs,
+                result={
+                    "final_video_path": final_path,
+                    "manifest_path": result.get("manifest_path") or "",
+                    "shots": shots,
+                    "tts_segments": result.get("tts_segments") or [],
+                    "used_ffmpeg": bool(result.get("used_ffmpeg")),
+                    "ffprobe_duration_total": result.get("ffprobe_duration_total") or 0,
+                    "errors": errs,
+                },
+                finished_at=time.time(),
+            )
+            db.add_log(
+                job_id=job_id, phase="video_succeeded",
+                method="INTERNAL", url="video_pipeline",
+                status_code=200,
+                response_body={
+                    "shots": len(shots),
+                    "final_video_path": final_path,
+                    "duration_sec": result.get("ffprobe_duration_total") or 0,
+                    "errors": errs,
+                },
+                duration_ms=(time.time() - t0) * 1000,
+            )
+        except Exception as e:
+            tb = traceback.format_exc()
+            err_msg = str(e)
+            # TTS 错误用专门文案；其它走 fp.summarize_upstream_error
+            if "TTS" in err_msg or "tts" in err_msg.lower():
+                user_msg = vp.summarize_tts_error(err_msg)
+            else:
+                user_msg = fp.summarize_upstream_error(err_msg)
+            sys.stderr.write(f"[VIDEO JOB FAILED] {job_id} {type(e).__name__}: {err_msg}\n")
+            traceback.print_exc(file=sys.stderr)
+            db.update_job(
+                job_id,
+                status="failed",
+                message=user_msg,
+                progress=100,
+                finished_at=time.time(),
+            )
+            db.add_log(
+                job_id=job_id, phase="video_failed",
+                method="INTERNAL", url="video_pipeline",
+                status_code=500,
+                error=user_msg,
+                response_body={"error_type": type(e).__name__},
+                duration_ms=(time.time() - t0) * 1000,
+            )
+
+@app.post("/api/video/generate")
+def api_video_generate():
+    """提交一条「文字 → 多镜头成片」任务；异步返回 job_id。"""
+    body = request.get_json(force=True, silent=True) or {}
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "请输入提示词"}), 400
+    options = body.get("options") or {}
+    if not isinstance(options, dict):
+        return jsonify({"error": "options 必须是对象"}), 400
+
+    auth = _auth_status()
+    if not auth.get("storage_exists") and not auth.get("token_ok"):
+        return (
+            jsonify({
+                "error": "未登录。请先运行: python token_daemon.py --start",
+                "auth": auth,
+            }),
+            400,
+        )
+
+    job_id = uuid.uuid4().hex[:12]
+    params = {
+        "prompt": prompt,
+        "options": {
+            "shot_count": options.get("shot_count"),
+            "duration_sec": options.get("duration_sec") or vp.DEFAULT_SHOT_DURATION,
+            "voice": options.get("voice") or vp.DEFAULT_VOICE,
+            "aspect_ratio": options.get("aspect_ratio") or vp.DEFAULT_ASPECT_RATIO,
+            "image_model": options.get("image_model") or "",
+            "image_model_version": options.get("image_model_version") or "",
+            "video_model": options.get("video_model") or "",
+            "video_model_version": options.get("video_model_version") or "",
+            "generate_audio": bool(options.get("generate_audio", True)),
+            "use_llm": bool(options.get("use_llm", False)),
+            "llm_model": options.get("llm_model") or "",
+        },
+    }
+    job = db.create_job({
+        "id": job_id,
+        "kind": "video_pipeline",
+        "status": "queued",
+        "message": "排队中",
+        "progress": 0,
+        "prompt": prompt,
+        "model": "",
+        "model_version": "",
+        "params": params,
+    })
+    db.add_log(
+        job_id=job_id, phase="api_video_generate",
+        method="POST", url="/api/video/generate",
+        status_code=202, request_body=params,
+    )
+    threading.Thread(target=_run_video_job, args=(job_id,), daemon=True).start()
+    return jsonify({"job_id": job_id, "job": _public_job(job)}), 202
+
+@app.get("/api/video/<job_id>")
+def api_video_get(job_id: str):
+    """查 video_pipeline 任务；最终返回 final_video_path / shots / manifest。"""
+    job = db.get_job(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    pub = _public_job(job) or {}
+    result = job.get("result") or {}
+    pub["final_video_path"] = result.get("final_video_path") or ""
+    pub["manifest_path"] = result.get("manifest_path") or ""
+    pub["shots"] = result.get("shots") or []
+    pub["used_ffmpeg"] = bool(result.get("used_ffmpeg"))
+    pub["ffprobe_duration_total"] = result.get("ffprobe_duration_total") or 0
+    return jsonify({"job": pub})
 
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -596,13 +877,12 @@ def main() -> None:
     except Exception as e:
         print(f"[models] preload failed: {e}")
 
-    host = fp.env("FLASK_HOST", "127.0.0.1")
+    host = fp.env("FLASK_HOST", "0.0.0.0")
     port = int(fp.env("FLASK_PORT", "7860") or 7860)
     print(f"[Firefly API] http://{host}:{port}")
     print(f"  db={DB_PATH}")
     print(f"  cors=*  frontend: cd frontend && npm run dev")
     app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
-
 
 if __name__ == "__main__":
     main()

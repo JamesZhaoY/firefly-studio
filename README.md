@@ -12,7 +12,9 @@ adobe/
   db.py                   # SQLite
   firefly_pipeline.py     # 上游 Firefly 客户端
   models_catalog.py       # 模型展开 + 预设
+  video_pipeline.py       # 一键成片（拆分 → 图 → 镜头 → TTS → 拼接）
   token_daemon.py         # Playwright 登录 + cookie 刷新
+  tests/                  # 纯函数测试
   data/                   # 运行期数据（git 忽略）
     storage.json
     current_token.json
@@ -74,6 +76,7 @@ npm run dev
 - **探索**：模型库网格，可点选跳回对话
 - **日志**：调用日志列表，支持清空
 - **清空对话** / **清空日志**：每个页面 topbar 右侧的垃圾箱按钮（带确认）
+- **一键成片**：对话 topbar 左侧按钮，弹出 slide-over 表单 → 提交 → 自动轮询，3-15 分钟出成片，可关闭面板后台运行
 - **快捷键**：`⌘↵` 提交 / `⌘/` 展开参数 / `⌘.` 切图片/视频
 
 ---
@@ -91,6 +94,10 @@ npm run dev
 | POST | `/api/chat/clear` | 清空所有任务及其日志 |
 | GET | `/api/logs` | 调用日志（`?job_id=`） |
 | DELETE | `/api/logs` | 清空所有调用日志 |
+| POST | `/api/video/generate` | 一键成片（文字 → 多镜头视频 + 配音） |
+| GET | `/api/video/<job_id>` | 一键成片任务详情（含 `final_video_path`） |
+| GET | `/api/voices` | TTS 可用语音列表（外部 Azure Neural 320+） |
+| GET | `/outputs/<path>` | 读取本地产物（成片 / 关键帧 / TTS） |
 
 ### 生成示例
 
@@ -117,6 +124,85 @@ POST /api/generate
 ```
 
 前端直接用 URL 预览 / 新开标签下载。
+
+### 一键成片（文字 → 多镜头视频）
+
+> 新增 `video_pipeline.py`：把一段自然语言描述自动拆成 3-6 个分镜，
+> 每个分镜先出关键帧、再出镜头视频、再出 TTS 配音，最后用 `ffmpeg` 拼接 + 混音，
+> 产物落在 `outputs/videos/<job_id>/final.mp4`，前端可直接 `<video>` 预览。
+
+请求：
+
+```bash
+curl -X POST http://127.0.0.1:7860/api/video/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt": "清晨森林里的小鹿走入薄雾，远处有鹿群奔过，最后太阳升起照亮山谷",
+    "options": {
+      "shot_count": 4,
+      "duration_sec": 6,
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "aspect_ratio": "16:9"
+    }
+  }'
+```
+
+返回（202）：
+
+```json
+{
+  "job_id": "a1b2c3d4e5f6",
+  "job": { "id": "a1b2c3d4e5f6", "status": "queued", "kind": "video_pipeline", ... }
+}
+```
+
+轮询：
+
+```bash
+curl http://127.0.0.1:7860/api/video/<job_id>
+```
+
+`status="succeeded"` 时 `result.final_video_path` 是绝对路径，
+前端可读 `outputs[]` 里的 `/outputs/videos/<job_id>/final.mp4` 直接预览。
+
+`options` 字段（全部可选）：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `shot_count` | 启发式 3-6 | 镜头数，clamp 到 [3, 6] |
+| `duration_sec` | `6` | 每个镜头目标时长（秒） |
+| `voice` | `zh-CN-XiaoxiaoNeural` | TTS 语音（`GET /api/voices` 取全量） |
+| `aspect_ratio` | `16:9` | 视频比例，影响关键帧 / 镜头尺寸 |
+| `image_model` / `image_model_version` | 空（用 fp 预设） | 关键帧模型 |
+| `video_model` / `video_model_version` | 空（用 fp 预设） | 镜头模型 |
+| `generate_audio` | `true` | 镜头自带音轨（与 TTS 配音独立） |
+| `use_llm` | `false` | `true` → 走 LLM 拆镜（见下文）；失败时自动回退到启发式 |
+
+**降级策略**：若系统未装 `ffmpeg`，不会抛异常，而是写一份 `manifest.json`
+到 `outputs/videos/<job_id>/`，前端能继续展示分镜进度与 URL。
+
+### LLM 分镜（可选）
+
+`options.use_llm=true` 时，`split_storyboard()` 改为调用 OpenAI 兼容的
+`/chat/completions` 拿到结构化 JSON 数组，再落回原来的图/镜/TTS 流水线。
+任意环节失败（LLM 未配置、超时、JSON 损坏）都会自动回退到原启发式拆分，
+不会让成片任务失败。
+
+请求体由 LLM 返回的字段：
+
+```json
+[ { "visual": "opening cinematic shot: ...", "narration": "清晨薄雾",
+    "duration": 6 }, ... ]
+```
+
+环境变量：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `LLM_BASE_URL` | `http://127.0.0.1:8317/v1` | 兼容 `/chat/completions` 的服务地址 |
+| `LLM_API_KEY` | `local-dev-key` | 鉴权 Bearer |
+| `LLM_MODEL` | `gpt-5.5` | 模型名 |
+| `LLM_TIMEOUT` | `20` | 单次请求超时（秒） |
 
 ### 调用日志阶段
 
@@ -150,8 +236,26 @@ POST /api/generate
 | `VITE_API_BASE` | 空（走代理） | 前端直连 API 时设 `http://127.0.0.1:7860` |
 | `FIREFLY_STORAGE` | `data/storage.json` | Playwright cookie |
 | `FIREFLY_TOKEN_FILE` | `data/current_token.json` | IMS token 缓存 |
+| `LLM_BASE_URL` | `http://127.0.0.1:8317/v1` | 一键成片 LLM 拆镜 base URL |
+| `LLM_API_KEY` | `local-dev-key` | 一键成片 LLM Bearer |
+| `LLM_MODEL` | `gpt-5.5` | 一键成片 LLM 模型 |
+| `LLM_TIMEOUT` | `20` | 一键成片 LLM 超时（秒） |
 
 ---
+
+## 测试
+
+```bash
+python tests/test_video_pipeline.py
+```
+
+只覆盖 `split_storyboard` 等纯函数；不调 Firefly 上游，也不打外网 TTS。
+
+CLI smoke（不联网，纯拆分）：
+
+```bash
+python video_pipeline.py "首先薄雾升起，然后小鹿出现，最后阳光洒落"
+```
 
 ## 生产部署
 

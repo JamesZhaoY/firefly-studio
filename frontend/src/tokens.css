@@ -1,0 +1,100 @@
+/* Firefly Studio design tokens
+   Single source of truth. All component CSS reads from here.
+   Locked accent: teal (singular). No purple, no glow, no warm gradient. */
+
+:root {
+  /* surface */
+  --bg: #0B0D11;
+  --bg-2: #11141A;
+  --bg-3: #181C25;
+  --bg-4: #1F242F;
+  --bg-hover: #232938;
+  --sidebar-bg: #0E1117;
+  --line: #1E232D;
+  --line-2: #2A3140;
+
+  /* text */
+  --fg: #E7EAEF;
+  --fg-2: #B0B7C2;
+  --fg-3: #6E7684;
+  --fg-4: #4D525B;
+
+  /* accent (teal, locked across whole page) */
+  --accent: #1AAEB4;
+  --accent-hover: #2BC0C6;
+  --accent-fg: #061518;
+  --accent-soft: rgba(26, 174, 180, 0.14);
+  --accent-strong: rgba(26, 174, 180, 0.30);
+  --accent-link: #A1FDFF;
+
+  /* status */
+  --ok: #6FBE8E;
+  --warn: #D4B266;
+  --err: #E07781;
+
+  /* chat */
+  --user-bubble: #1A1F2A;
+
+  /* radius scale (documented rule):
+     xs=4 tiny badges  |  sm=8 inputs, ghost buttons  |  md=12 cards
+     lg=16 composer, bubble  |  pill primary CTAs, status dots */
+  --r-xs: 4px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-pill: 999px;
+
+  /* shell */
+  --sidebar-w: 252px;
+  --sidebar-w-collapsed: 64px;
+  --topbar-h: 56px;
+  --composer-max: 760px;
+  --content-max: 1280px;
+  --logs-max: 960px;
+
+  /* shadow (tinted, no pure black) */
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.24), 0 10px 24px rgb(2 10 15 / 0.22);
+  --shadow-2: 0 2px 4px rgb(0 0 0 / 0.28), 0 20px 48px rgb(2 10 15 / 0.32);
+
+  /* type */
+  --sans: 'Geist Sans', 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+          'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --mono: 'Geist Mono', ui-monospace, 'JetBrains Mono', Consolas, monospace;
+
+  /* motion */
+  --t-fast: 120ms;
+  --t-mid: 160ms;
+  --t-slow: 240ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  font-family: var(--sans);
+  color-scheme: dark;
+}
+
+[data-theme='light'] {
+  --bg: #FAFAF7;
+  --bg-2: #FFFFFF;
+  --bg-3: #F4F2EC;
+  --bg-4: #EFEBE3;
+  --bg-hover: #E8E5DD;
+  --sidebar-bg: #F4F2EC;
+  --line: #E5E2D8;
+  --line-2: #D5D2C8;
+  --fg: #14171C;
+  --fg-2: #4D525B;
+  --fg-3: #8A8E96;
+  --fg-4: #B0B5BE;
+  --accent: #128389;
+  --accent-hover: #0E6E73;
+  --accent-fg: #FFFFFF;
+  --accent-soft: rgba(18, 131, 137, 0.10);
+  --accent-strong: rgba(18, 131, 137, 0.24);
+  --accent-link: #0E6E73;
+  --ok: #388F5F;
+  --warn: #9E7A2A;
+  --err: #B04650;
+  --user-bubble: #F0EFE9;
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 16px rgba(0, 0, 0, 0.06);
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.10), 0 8px 32px rgba(0, 0, 0, 0.10);
+  color-scheme: light;
+}
