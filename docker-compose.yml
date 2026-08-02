@@ -16,8 +16,8 @@ services:
     container_name: firefly-app
     restart: unless-stopped
     # Only ONE public port. Nginx listens here; it forwards /api/* to gunicorn.
-    ports:
-      - "19999:19999"
+    # Port publishing lives on the `warp` sidecar because the app uses
+    # `network_mode: service:warp` and cannot define ports of its own.
     volumes:
       # Persistent Adobe credentials + SQLite. Mount a host dir so the DB
       # survives `docker compose down` / `docker rm`.
@@ -27,7 +27,9 @@ services:
     network_mode: "service:warp"
     depends_on:
       warp:
-        condition: service_healthy
+        # ponytail: WARP healthcheck may stay disconnected in offline environments;
+        # don't block app startup — just let it come up alongside.
+        condition: service_started
     environment:
       # gunicorn binds to internal port (nginx proxies in)
       PORT: "19998"
@@ -47,6 +49,9 @@ services:
     image: caomingjun/warp:latest
     container_name: firefly-warp
     restart: unless-stopped
+    ports:
+      # App shares WARP's network namespace; expose the public port here.
+      - "19999:19999"
     dns:
       - 1.1.1.1
       - 1.0.0.1

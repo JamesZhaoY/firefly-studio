@@ -11,9 +11,9 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 
 COPY frontend/ ./
-# Set base path so assets load from /firefly-studio/...
-# (matches the GitHub Pages path; harmless if served at root)
-ARG VITE_PAGES_BASE=/firefly-studio/
+# Container serves the SPA at root, so build with an empty base path.
+# (Pages deployments can still override VITE_PAGES_BASE in CI.)
+ARG VITE_PAGES_BASE=/
 ARG VITE_API_BASE=
 ENV VITE_PAGES_BASE=${VITE_PAGES_BASE}
 ENV VITE_API_BASE=${VITE_API_BASE}
@@ -38,7 +38,8 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 # App code
-COPY app.py db.py firefly_pipeline.py models_catalog.py wsgi.py ./
+COPY app.py db.py firefly_pipeline.py models_catalog.py wsgi.py video_pipeline.py ./
+COPY tests/ ./tests/
 
 # Frontend build artifacts → nginx serves these
 COPY --from=frontend /web/dist /web/frontend/dist

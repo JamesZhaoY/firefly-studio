@@ -28,9 +28,11 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import os
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, TypeVar
 
 import firefly_pipeline as fp
+
+T = TypeVar("T")
 
 # ── 常量 ───────────────────────────────────────────────────────
 
@@ -684,7 +686,7 @@ class VideoOptions:
     poll_interval: float = 6.0
 
 
-def _safe_run[T](fn: Callable[[], T], *, label: str, default: T) -> T:
+def _safe_run(fn, *, label, default):
     try:
         return fn()
     except Exception as e:

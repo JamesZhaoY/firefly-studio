@@ -1,0 +1,32 @@
+name: firefly-studio
+
+# Architecture (one container, no WARP sidecar):
+#
+#   user → host:19999 (公网IP/本地回环) ─► [nginx :19999]
+#                                              ├─ /             → React static (build)
+#                                              └─ /api/*        → gunicorn :19998 (Flask)
+#                                                              └─ curl_cffi → host's VPN → Adobe
+#
+# Use this file when the Docker host already has a VPN / proxy tunnel
+# to Adobe. Outbound traffic inherits the host's network and reaches
+# Adobe directly via the VPN, so no sidecar is required.
+
+services:
+  app:
+    build: .
+    image: firefly-studio:latest
+    container_name: firefly-app
+    restart: unless-stopped
+    ports:
+      - "19999:19999"
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+    environment:
+      PORT: "19998"
+      FLASK_HOST: "127.0.0.1"
+      FLASK_DEBUG: "0"
+      PYTHONUNBUFFERED: "1"
+      CORS_ORIGINS: "*"
+      STORAGE_JSON: ""
+      TOKEN_JSON: ""
