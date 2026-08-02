@@ -915,8 +915,6 @@ def api_video_generate():
             "duration_sec": options.get("duration_sec") or vp.DEFAULT_SHOT_DURATION,
             "voice": options.get("voice") or vp.DEFAULT_VOICE,
             "aspect_ratio": options.get("aspect_ratio") or vp.DEFAULT_ASPECT_RATIO,
-            "image_model": options.get("image_model") or "",
-            "image_model_version": options.get("image_model_version") or "",
             "video_model": options.get("video_model") or "",
             "video_model_version": options.get("video_model_version") or "",
             "generate_audio": bool(options.get("generate_audio", True)),

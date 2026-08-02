@@ -176,8 +176,7 @@ curl http://127.0.0.1:7860/api/video/<job_id>
 | `shot_count` | 启发式 3-6 | 镜头数，clamp 到 [3, 6] |
 | `duration_sec` | `6` | 每个镜头目标时长（秒） |
 | `voice` | `zh-CN-XiaoxiaoNeural` | TTS 语音（`GET /api/voices` 取全量） |
-| `aspect_ratio` | `16:9` | 视频比例，影响关键帧 / 镜头尺寸 |
-| `image_model` / `image_model_version` | 空（用 fp 预设） | 关键帧模型 |
+| `aspect_ratio` | `16:9` | 视频比例，影响镜头尺寸 |
 | `video_model` / `video_model_version` | 空（用 fp 预设） | 镜头模型 |
 | `generate_audio` | `true` | 镜头自带音轨（与 TTS 配音独立） |
 | `use_llm` | `false` | `true` → 走 LLM 拆镜（见下文）；失败时自动回退到启发式 |

@@ -26,14 +26,12 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 import os
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable
 
 import firefly_pipeline as fp
-
-T = TypeVar("T")
 
 # ── 常量 ───────────────────────────────────────────────────────
 
@@ -41,7 +39,6 @@ APP_ROOT = Path(__file__).resolve().parent
 OUT_DIR = APP_ROOT / "outputs"
 VIDEO_DIR = OUT_DIR / "videos"
 TTS_DIR = OUT_DIR / "tts"
-TEMP_DIR = OUT_DIR / "tmp"
 
 TTS_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
 TTS_FALLBACK_VOICE = "en-US-JennyNeural"
@@ -52,16 +49,11 @@ MIN_SHOTS = 3
 MAX_SHOTS = 6
 DEFAULT_SHOT_DURATION = 6  # 秒
 
-# 默认视频 / 图片模型（与现有 app.py 行为一致，让 firefly_pipeline 选预设）
-DEFAULT_IMAGE_MODEL = ""
-DEFAULT_IMAGE_MODEL_VERSION = ""
+# 默认视频模型（让 firefly_pipeline 选预设）
 DEFAULT_VIDEO_MODEL = ""
 DEFAULT_VIDEO_MODEL_VERSION = ""
 DEFAULT_ASPECT_RATIO = "16:9"
 DEFAULT_VOICE = TTS_DEFAULT_VOICE
-
-# 关键帧解析度（firefly_pipeline.VIDEO_SIZE_BY_ASPECT 的 16:9 是 854x480）
-DEFAULT_KEYFRAME_SIZE = "1280x720"
 
 
 # ── Storyboard 拆分（纯函数，方便测试） ──────────────────────────
@@ -825,8 +817,6 @@ class VideoOptions:
     duration_sec: int = DEFAULT_SHOT_DURATION
     voice: str = DEFAULT_VOICE
     aspect_ratio: str = DEFAULT_ASPECT_RATIO
-    image_model: str = DEFAULT_IMAGE_MODEL
-    image_model_version: str = DEFAULT_IMAGE_MODEL_VERSION
     video_model: str = DEFAULT_VIDEO_MODEL
     video_model_version: str = DEFAULT_VIDEO_MODEL_VERSION
     generate_audio: bool = True  # 视频自带的音轨；和 TTS 配音是两套
@@ -834,42 +824,6 @@ class VideoOptions:
     llm_model: str = ""          # 覆盖 LLM 拆镜模型（空 = env LLM_MODEL）
     max_wait: float = 1800.0
     poll_interval: float = 6.0
-
-
-def _safe_run(fn, *, label, default):
-    try:
-        return fn()
-    except Exception as e:
-        sys.stderr.write(f"[{label}] {type(e).__name__}: {e}\n")
-        return default
-
-
-def generate_shot_image(
-    plan: ShotPlan, options: VideoOptions, *, work: Path
-) -> tuple[str, Path | None]:
-    """调 fp.generate_image，下载到 work/<name>.<ext>，返回 (url, path)。"""
-    work.mkdir(parents=True, exist_ok=True)
-    out = fp.generate_image(
-        plan.visual_prompt,
-        model=options.image_model,
-        model_version=options.image_model_version,
-        n=1,
-        size=DEFAULT_KEYFRAME_SIZE,
-        seeds=None,
-        detail_level=3,
-        poll_interval=options.poll_interval,
-        max_wait=options.max_wait,
-        download_dir=work,
-    )
-    outputs = out.get("outputs") or []
-    for o in outputs:
-        url = o.get("url")
-        if not url:
-            continue
-        ext = o.get("ext") or fp.guess_ext(url, ".jpg")
-        local = o.get("local_path")
-        return url, (Path(local) if local else work / f"image{ext}")
-    return "", None
 
 
 def generate_shot_video(
@@ -971,10 +925,6 @@ def generate_full_video(
         duration_sec=int(options_dict.get("duration_sec") or DEFAULT_SHOT_DURATION),
         voice=str(options_dict.get("voice") or DEFAULT_VOICE),
         aspect_ratio=str(options_dict.get("aspect_ratio") or DEFAULT_ASPECT_RATIO),
-        image_model=str(options_dict.get("image_model") or DEFAULT_IMAGE_MODEL),
-        image_model_version=str(
-            options_dict.get("image_model_version") or DEFAULT_IMAGE_MODEL_VERSION
-        ),
         video_model=str(options_dict.get("video_model") or DEFAULT_VIDEO_MODEL),
         video_model_version=str(
             options_dict.get("video_model_version") or DEFAULT_VIDEO_MODEL_VERSION
