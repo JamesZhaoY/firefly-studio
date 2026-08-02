@@ -27,21 +27,16 @@ export function ExploreCard({ model, selectedKey, onPick }) {
   const k = `${model.id}@@${model.version}`
   const isSelected = k === selectedKey
   return (
-    <div
+    <button
+      type="button"
       className={`explore-card ${isSelected ? 'selected' : ''}`}
       onClick={() => onPick(model)}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          onPick(model)
-        }
-      }}
     >
+      {isSelected && <span className="explore-card-selected">已选</span>}
       <span className="explore-card-kind">{model.kind || 'image'}</span>
       <span className="explore-card-title">{model.id}</span>
       <span className="explore-card-ver">{model.version}</span>
+      <div className="explore-card-capabilities">{(model.durations || model.aspect_ratios || model.audio != null) && [model.durations?.length && `${model.durations.join('/')}s`, model.aspect_ratios?.join(' / '), model.audio != null && (model.audio ? '支持音频' : '无音频'), model.input_use && `输入：${model.input_use}`].filter(Boolean).map((x) => <span key={x}>{x}</span>)}</div>
       <div className="explore-card-foot">
         {model.provider && (
           <span className="explore-card-provider">{model.provider}</span>
@@ -52,7 +47,7 @@ export function ExploreCard({ model, selectedKey, onPick }) {
           </span>
         )}
       </div>
-    </div>
+    </button>
   )
 }
 

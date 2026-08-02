@@ -1,12 +1,13 @@
 const BASE = import.meta.env.VITE_API_BASE || ''
 
 async function request(path, opts = {}) {
+  const { headers = {}, ...rest } = opts
   const url = BASE
     ? `${BASE.replace(/\/$/, '')}${path}`
     : path
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
-    ...opts,
+    headers: { 'Content-Type': 'application/json', ...headers },
+    ...rest,
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
@@ -39,4 +40,5 @@ export const api = {
     request('/api/video/generate', { method: 'POST', body: JSON.stringify(body) }),
   videoJob: (id) => request(`/api/video/${id}`),
   voices: () => request('/api/voices'),
+  llmModels: () => request('/api/llm-models'),
 }

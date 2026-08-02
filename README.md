@@ -12,7 +12,7 @@ adobe/
   db.py                   # SQLite
   firefly_pipeline.py     # 上游 Firefly 客户端
   models_catalog.py       # 模型展开 + 预设
-  video_pipeline.py       # 一键成片（拆分 → 图 → 镜头 → TTS → 拼接）
+  video_pipeline.py       # 一键成片（拆分 → 镜头视频 → TTS → 拼接）
   token_daemon.py         # Playwright 登录 + cookie 刷新
   tests/                  # 纯函数测试
   data/                   # 运行期数据（git 忽略）
@@ -96,7 +96,8 @@ npm run dev
 | DELETE | `/api/logs` | 清空所有调用日志 |
 | POST | `/api/video/generate` | 一键成片（文字 → 多镜头视频 + 配音） |
 | GET | `/api/video/<job_id>` | 一键成片任务详情（含 `final_video_path`） |
-| GET | `/api/voices` | TTS 可用语音列表（外部 Azure Neural 320+） |
+| GET | `/api/voices` | TTS 可用语音列表（Microsoft Edge TTS via `edge-tts`） |
+| GET | `/api/llm-models` | 从 LLM 服务的 `/v1/models` 获取分镜模型列表 |
 | GET | `/outputs/<path>` | 读取本地产物（成片 / 关键帧 / TTS） |
 
 ### 生成示例
@@ -128,8 +129,11 @@ POST /api/generate
 ### 一键成片（文字 → 多镜头视频）
 
 > 新增 `video_pipeline.py`：把一段自然语言描述自动拆成 3-6 个分镜，
-> 每个分镜先出关键帧、再出镜头视频、再出 TTS 配音，最后用 `ffmpeg` 拼接 + 混音，
+> 每个分镜出镜头视频、再出 TTS 配音，最后用 `ffmpeg` 拼接 + 混音，
 > 产物落在 `outputs/videos/<job_id>/final.mp4`，前端可直接 `<video>` 预览。
+>
+> TTS 由 `edge-tts` 提供（Microsoft Edge 公开接口），不需要 Adobe 账号。
+> 任意镜头 TTS 失败时，自动用对应时长的静音兜底，不阻断合成；任务日志会记录具体失败项。
 
 请求：
 
@@ -204,6 +208,10 @@ curl http://127.0.0.1:7860/api/video/<job_id>
 | `LLM_MODEL` | `gpt-5.5` | 模型名 |
 | `LLM_TIMEOUT` | `20` | 单次请求超时（秒） |
 
+Docker Desktop 中本地 LLM 跑在宿主机时，Compose 已将 `LLM_BASE_URL` 配置为
+`http://host.llm:8317/v1`。该别名通过 Docker `host-gateway` 注入，避免 WARP
+sidecar 重写 `host.docker.internal`；容器内的 `127.0.0.1` 只指向容器自身。
+
 ### 调用日志阶段
 
 每次生成会按顺序写 4 条 `api_logs` 行：
@@ -245,11 +253,18 @@ curl http://127.0.0.1:7860/api/video/<job_id>
 
 ## 测试
 
+推荐在 `.venv` 环境下运行（系统 Python 通常没装 `edge-tts` 等依赖）：
+
 ```bash
+# 在仓库根目录
+.venv/bin/python tests/test_video_pipeline.py
+# 或先激活 venv 再跑
 python tests/test_video_pipeline.py
 ```
 
-只覆盖 `split_storyboard` 等纯函数；不调 Firefly 上游，也不打外网 TTS。
+只覆盖 `split_storyboard` / `resolve_final_duration` / `_coerce_shot` /
+`_validate_video_options` 等纯函数；不调 Firefly 上游，也不打外网 TTS / LLM。
+不需要 pytest，直接 `assert` 风格。
 
 CLI smoke（不联网，纯拆分）：
 

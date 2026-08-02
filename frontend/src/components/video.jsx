@@ -1,7 +1,7 @@
 // video: slide-over panel for 一键成片.
 // Owns form / progress / result views. Polling is lifted to App (single source of truth).
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'motion/react'
 import { keyOf } from './util.js'
 
@@ -9,9 +9,6 @@ const SHOT_OPTIONS = [3, 4, 5, 6]
 const DUR_OPTIONS = [4, 6, 8]
 const ASPECT_OPTIONS = ['16:9', '9:16']
 const DEFAULT_VOICE = 'zh-CN-XiaoxiaoNeural'
-const DEFAULT_LLM_MODEL = 'gpt-5.5'
-// datalist 建议值；后端未填 llm_model 时走 env LLM_MODEL
-const LLM_MODEL_PRESETS = ['gpt-5.5', 'gpt-4o', 'claude-sonnet-4-5', 'gemini-2.5-pro', 'qwen3-max', 'deepseek-v3']
 
 // 备选用 voice，避免 /api/voices 第一次还在飞时面板是空的
 const FALLBACK_VOICES = [
@@ -48,9 +45,13 @@ function ChipRow({ label, options, value, onChange, suffix = '' }) {
 }
 
 // 通用下拉：voice / image model / video model 共用（复用 vp-voice-* 样式）
+// 键盘：Esc 关闭；上/下箭头移动活动项；Enter 选择；首字母聚焦由 panel 焦点管理承担。
 function SelectField({ label, value, options, onChange, placeholder = '未选择' }) {
   const [open, setOpen] = useState(false)
+  const [focusIdx, setFocusIdx] = useState(-1)
   const wrapRef = useRef(null)
+  const triggerRef = useRef(null)
+  const listRef = useRef(null)
   const selected = options.find((o) => o.value === value) || null
   useEffect(() => {
     if (!open) return undefined
@@ -60,13 +61,60 @@ function SelectField({ label, value, options, onChange, placeholder = '未选择
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
   }, [open])
+  useEffect(() => {
+    if (!open) return
+    const idx = Math.max(0, options.findIndex((o) => o.value === value))
+    setFocusIdx(idx === -1 ? 0 : idx)
+  }, [open, value, options])
+  useEffect(() => {
+    if (!open || focusIdx < 0) return
+    const el = listRef.current?.querySelectorAll('.vp-voice-opt')?.[focusIdx]
+    el?.focus()
+  }, [focusIdx, open])
+
+  function onTriggerKey(e) {
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      setOpen(true)
+    }
+  }
+  function onListKey(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      setOpen(false)
+      triggerRef.current?.focus()
+      return
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      setFocusIdx((i) => Math.min(options.length - 1, i + 1))
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      setFocusIdx((i) => Math.max(0, i - 1))
+      return
+    }
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      const opt = options[focusIdx]
+      if (opt) {
+        onChange(opt.value)
+        setOpen(false)
+        triggerRef.current?.focus()
+      }
+    }
+  }
+
   return (
     <div className="vp-field" ref={wrapRef}>
       <span className="vp-label">{label}</span>
       <button
+        ref={triggerRef}
         type="button"
         className={`vp-voice-trigger ${open ? 'open' : ''}`}
         onClick={() => setOpen((v) => !v)}
+        onKeyDown={onTriggerKey}
         aria-expanded={open}
         aria-haspopup="listbox"
       >
@@ -79,8 +127,14 @@ function SelectField({ label, value, options, onChange, placeholder = '未选择
         </svg>
       </button>
       {open && (
-        <ul className="vp-voice-list" role="listbox" aria-label={label}>
-          {options.map((o) => (
+        <ul
+          className="vp-voice-list"
+          role="listbox"
+          aria-label={label}
+          ref={listRef}
+          onKeyDown={onListKey}
+        >
+          {options.map((o, i) => (
             <li key={o.value}>
               <button
                 type="button"
@@ -88,6 +142,7 @@ function SelectField({ label, value, options, onChange, placeholder = '未选择
                 aria-selected={o.value === value}
                 className={`vp-voice-opt ${o.value === value ? 'on' : ''}`}
                 onClick={() => { onChange(o.value); setOpen(false) }}
+                tabIndex={i === focusIdx ? 0 : -1}
               >
                 <span className="vp-voice-opt-id">{o.primary}</span>
                 {o.meta ? <span className="vp-voice-opt-meta">{o.meta}</span> : null}
@@ -134,35 +189,97 @@ function ModelSelect({ label, models, value, onChange }) {
   )
 }
 
-function FormView({ voices, imageModels, videoModels, busy, onSubmit, errorMsg }) {
+function LlmModelSelect({ models, value, onChange }) {
+  return (
+    <SelectField
+      label="分镜模型"
+      value={value}
+      onChange={onChange}
+      placeholder={models.length ? '使用后端默认模型' : '分镜模型加载中…'}
+      options={[
+        { value: '', primary: '使用后端默认模型', meta: '由 LLM_MODEL 配置决定' },
+        ...models.map((id) => ({ value: id, primary: id, meta: '来自 /v1/models' })),
+      ]}
+    />
+  )
+}
+
+function FormView({ voices, llmModels, videoModels, busy, onSubmit, errorMsg }) {
   const [prompt, setPrompt] = useState('')
   const [shotCount, setShotCount] = useState(4)
   const [duration, setDuration] = useState(6)
   const [voice, setVoice] = useState(DEFAULT_VOICE)
   const [aspect, setAspect] = useState('16:9')
   const [useLlm, setUseLlm] = useState(false)
-  const [imageModelKey, setImageModelKey] = useState('')
   const [videoModelKey, setVideoModelKey] = useState('')
   const [llmModel, setLlmModel] = useState('')
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  // 模型切换后给用户一次简短提示
+  const [modelChangeNote, setModelChangeNote] = useState('')
   // voice 列表回到之后，更新默认选中（仅当用户没主动改过）
   useEffect(() => {
     if (!voices.length) return
     if (voices.some((v) => v.id === voice)) return
     setVoice(voices[0].id)
   }, [voices, voice])
-  // 模型列表到达后挑默认（仅当用户没主动改过）
-  useEffect(() => {
-    if (!imageModels.length || imageModelKey) return
-    const prefer = imageModels.find((m) => m.id === 'gpt-image') || imageModels[0]
-    setImageModelKey(keyOf(prefer))
-  }, [imageModels, imageModelKey])
   useEffect(() => {
     if (!videoModels.length || videoModelKey) return
     const prefer = videoModels.find((m) => String(m.id).includes('seedance')) || videoModels[0]
     setVideoModelKey(keyOf(prefer))
   }, [videoModels, videoModelKey])
 
-  const canSubmit = !busy && prompt.trim().length > 0
+  // 按当前所选视频模型的能力动态算可选时长 / 比例
+  const selectedVideoModel = useMemo(
+    () => videoModels.find((m) => keyOf(m) === videoModelKey) || null,
+    [videoModels, videoModelKey],
+  )
+  const durOptions = useMemo(() => {
+    const durs = selectedVideoModel?.durations?.length
+      ? selectedVideoModel.durations
+      : DUR_OPTIONS
+    return durs.filter((d) => Number.isFinite(Number(d))).map((d) => Number(d))
+  }, [selectedVideoModel])
+  const aspectOptions = useMemo(() => {
+    const aspects = selectedVideoModel?.aspect_ratios?.length
+      ? selectedVideoModel.aspect_ratios
+      : ASPECT_OPTIONS
+    return aspects.filter((a) => typeof a === 'string' && a)
+  }, [selectedVideoModel])
+  const videoSupportsAudio = selectedVideoModel?.audio !== false
+
+  // 模型切换时若当前 duration/aspect 不在能力里，落到合法值并提示
+  useEffect(() => {
+    if (!selectedVideoModel) return
+    let changed = []
+    if (durOptions.length && !durOptions.includes(Number(duration))) {
+      changed.push(`${durOptions[0]}s`)
+      setDuration(durOptions[0])
+    }
+    if (aspectOptions.length && !aspectOptions.includes(aspect)) {
+      changed.push(aspectOptions[0])
+      setAspect(aspectOptions[0])
+    }
+    if (changed.length) {
+      setModelChangeNote(`已更新为该模型支持的 ${changed.join(' / ')}`)
+      const t = setTimeout(() => setModelChangeNote(''), 4000)
+      return () => clearTimeout(t)
+    }
+    return undefined
+  }, [selectedVideoModel]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 输出摘要
+  const totalSec = shotCount * Number(duration || 0)
+  const totalText = totalSec >= 60
+    ? `${Math.floor(totalSec / 60)}分${totalSec % 60}秒`
+    : `${totalSec}秒`
+  // 估算耗时：每镜生成经验值 60s + 拼接 30s
+  const estSec = Math.max(120, shotCount * 60 + 30)
+  const estText = estSec >= 60
+    ? `${Math.floor(estSec / 60)}-${Math.ceil(estSec / 60) + 2} 分钟`
+    : `${estSec}秒`
+
+  const canSubmit = !busy && prompt.trim().length > 0 && !!selectedVideoModel
+  const noModels = videoModels.length === 0
 
   function modelParts(models, key) {
     const m = models.find((x) => keyOf(x) === key)
@@ -172,7 +289,6 @@ function FormView({ voices, imageModels, videoModels, busy, onSubmit, errorMsg }
   function submit(e) {
     e?.preventDefault?.()
     if (!canSubmit) return
-    const img = modelParts(imageModels, imageModelKey)
     const vid = modelParts(videoModels, videoModelKey)
     onSubmit({
       prompt: prompt.trim(),
@@ -181,9 +297,8 @@ function FormView({ voices, imageModels, videoModels, busy, onSubmit, errorMsg }
         duration_sec: duration,
         voice,
         aspect_ratio: aspect,
+        generate_audio: videoSupportsAudio,
         use_llm: useLlm,
-        image_model: img.model,
-        image_model_version: img.version,
         video_model: vid.model,
         video_model_version: vid.version,
         llm_model: llmModel.trim(),
@@ -199,55 +314,48 @@ function FormView({ voices, imageModels, videoModels, busy, onSubmit, errorMsg }
           className="vp-textarea"
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          rows={5}
+          rows={4}
           placeholder="例如：清晨森林里的小鹿走入薄雾，远处是鹿群奔过，最后太阳升起照亮山谷。"
           aria-label="成片描述"
         />
       </label>
 
-      <ModelSelect
-        label="生成图片模型"
-        models={imageModels}
-        value={imageModelKey}
-        onChange={setImageModelKey}
-      />
+      <div className="vp-summary" aria-label="输出摘要">
+        <span className="vp-summary-item">
+          <span className="vp-summary-num">{shotCount}</span>
+          <span className="vp-summary-label">镜头</span>
+        </span>
+        <span className="vp-summary-sep">×</span>
+        <span className="vp-summary-item">
+          <span className="vp-summary-num">{duration}{duration ? 's' : ''}</span>
+          <span className="vp-summary-label">每镜</span>
+        </span>
+        <span className="vp-summary-sep">=</span>
+        <span className="vp-summary-item">
+          <span className="vp-summary-num">{totalText}</span>
+          <span className="vp-summary-label">总时长（估）</span>
+        </span>
+        <span className="vp-summary-meta">
+          {aspect || '比例未选'} · 预计耗时 {estText}
+        </span>
+      </div>
+
       <ModelSelect
         label="生成视频模型"
         models={videoModels}
         value={videoModelKey}
         onChange={setVideoModelKey}
       />
-      <label className="vp-field">
-        <span className="vp-label">分镜模型</span>
-        <input
-          className="vp-text-input"
-          type="text"
-          list="vp-llm-models"
-          value={llmModel}
-          onChange={(e) => setLlmModel(e.target.value)}
-          placeholder={DEFAULT_LLM_MODEL}
-          aria-label="分镜模型"
-        />
-        <datalist id="vp-llm-models">
-          {LLM_MODEL_PRESETS.map((m) => <option key={m} value={m} />)}
-        </datalist>
-        <span className="vp-toggle-hint">开启「用 AI 拆镜」后生效；留空用后端默认。</span>
-      </label>
-
-      <label className="vp-toggle">
-        <input
-          type="checkbox"
-          checked={useLlm}
-          onChange={(e) => setUseLlm(e.target.checked)}
-        />
-        <span className="vp-toggle-track" aria-hidden="true">
-          <span className="vp-toggle-knob" />
-        </span>
-        <span className="vp-toggle-text">
-          <span>用 AI 拆镜</span>
-          <span className="vp-toggle-hint">开启后走 LLM 分镜；否则按提示词长度启发式。</span>
-        </span>
-      </label>
+      {noModels && (
+        <div className="vp-toggle-hint">正在加载视频模型…若持续为空请刷新或重试。</div>
+      )}
+      {modelChangeNote && (
+        <div className="vp-toggle-hint vp-model-note" role="status">{modelChangeNote}</div>
+      )}
+      {!videoSupportsAudio && (
+        <div className="vp-toggle-hint">当前视频模型不支持自带音频，将仅使用 TTS 配音。</div>
+      )}
+      <VoiceSelect voices={voices} value={voice} onChange={setVoice} />
 
       <ChipRow
         label="镜头数"
@@ -257,26 +365,59 @@ function FormView({ voices, imageModels, videoModels, busy, onSubmit, errorMsg }
       />
       <ChipRow
         label="每镜时长"
-        options={DUR_OPTIONS}
+        options={durOptions}
         value={duration}
         onChange={setDuration}
         suffix="s"
       />
       <ChipRow
         label="比例"
-        options={ASPECT_OPTIONS}
+        options={aspectOptions}
         value={aspect}
         onChange={setAspect}
       />
-      <VoiceSelect voices={voices} value={voice} onChange={setVoice} />
+
+      <button
+        type="button"
+        className={`vp-advanced-toggle ${advancedOpen ? 'open' : ''}`}
+        onClick={() => setAdvancedOpen((v) => !v)}
+        aria-expanded={advancedOpen}
+      >
+        <span>高级选项</span>
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" strokeWidth="2"
+             strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M6 9l6 6 6-6" />
+        </svg>
+      </button>
+      {advancedOpen && (
+        <div className="vp-advanced-panel">
+          <label className="vp-toggle">
+            <input
+              type="checkbox"
+              checked={useLlm}
+              onChange={(e) => setUseLlm(e.target.checked)}
+            />
+            <span className="vp-toggle-track" aria-hidden="true">
+              <span className="vp-toggle-knob" />
+            </span>
+            <span className="vp-toggle-text">
+              <span>用 AI 拆镜</span>
+              <span className="vp-toggle-hint">开启后走 LLM 分镜；否则按提示词长度启发式。</span>
+            </span>
+          </label>
+          <LlmModelSelect models={llmModels} value={llmModel} onChange={setLlmModel} />
+          <span className="vp-toggle-hint">开启「用 AI 拆镜」后生效；模型列表来自 LLM 服务的 `/v1/models`。</span>
+        </div>
+      )}
 
       {errorMsg && <div className="vp-error">{errorMsg}</div>}
 
       <button type="submit" className="vp-submit" disabled={!canSubmit}>
-        {busy ? '提交中…' : '开始生成'}
+        {busy ? '提交中…' : (noModels ? '无可用视频模型' : '开始生成')}
       </button>
       <p className="vp-foot-hint">
-        生成 3-6 个镜头约需 3-15 分钟；面板可关闭，任务在后台继续。
+        总时长为估算值，最终时长由实际视频与配音决定；面板可关闭，任务在后台继续。
       </p>
     </form>
   )
@@ -292,6 +433,7 @@ function ShotRow({ shot }) {
   const narration = shot.narration || ''
   return (
     <div className={`vp-shot ${iconClass}`}>
+      <div className="vp-shot-thumb">{shot.videoUrl ? <video src={shot.videoUrl} muted preload="metadata" aria-label={`${label}视频`} /> : <span aria-hidden="true">镜头</span>}</div>
       <span className={`vp-shot-mark ${iconClass}`} aria-hidden="true">
         {status === 'succeeded' ? '✓' :
          status === 'failed' ? '×' :
@@ -318,16 +460,24 @@ function statusLabel(s) {
 }
 
 function stageLabel(stage, status) {
-  if (status === 'succeeded' || status === 'failed') return statusLabel(status)
-  return stage === 'keyframe' ? '出关键帧' :
-         stage === 'video' ? '生成视频' :
-         stage === 'tts' ? '合成配音' : statusLabel(status)
+  if (status === 'succeeded') return '完成'
+  if (status === 'failed') return '失败'
+  switch (stage) {
+    case 'planned': return '待开始'
+    case 'video': return '生成视频'
+    case 'tts': return '合成配音'
+    case 'concatenated': return '已加入成片'
+    case 'done': return '完成'
+    case 'failed': return '失败'
+    default: return statusLabel(status)
+  }
 }
 
 function ProgressView({ job, onClose }) {
   const shots = job?.shots || []
   const done = job?.status === 'succeeded'
   const failed = job?.status === 'failed'
+  const stale = !done && !failed && shots.length > 0 && shots.every((s) => s.status === 'queued')
   const message = job?.message || '准备中…'
   const pct = Number(job?.progress || 0)
   const running = shots.find((s) => s.status === 'running') ||
@@ -352,7 +502,8 @@ function ProgressView({ job, onClose }) {
           transition={{ duration: 0.4 }}
         />
       </div>
-      <div className="vp-progress-foot">{message}</div>
+      <div className="vp-progress-foot" aria-live="polite">{message}</div>
+      {stale && <div className="vp-idle-hint">仍在等待上游返回，可关闭面板后继续。</div>}
 
       <div className="vp-shots">
         {shots.map((s) => <ShotRow key={s.index} shot={s} />)}
@@ -373,7 +524,8 @@ function ProgressView({ job, onClose }) {
 
 function ResultView({ job, onAgain }) {
   const shots = job?.shots || []
-  const videoSrc = job?.finalVideoUrl || ''
+  const videoSrc = job?.status === 'succeeded' ? (job?.finalVideoUrl || '') : ''
+  const partial = job?.status === 'failed' && shots.length > 0
   const manifestUrl = job?.manifestUrl || ''
   return (
     <div className="vp-result">
@@ -381,7 +533,7 @@ function ResultView({ job, onAgain }) {
         {videoSrc ? (
           <video controls src={videoSrc} preload="metadata" />
         ) : (
-          <div className="vp-video-missing">最终视频文件不可用。</div>
+          <div className={`vp-result-summary ${partial ? 'warn' : 'err'}`} role="status">{partial ? '部分完成：分镜已保留，但最终合成失败。' : '生成失败：没有可用的最终成片。'}</div>
         )}
       </div>
 
@@ -410,8 +562,8 @@ function ResultView({ job, onAgain }) {
         <div className="vp-result-grid">
           {shots.map((s) => (
             <div key={s.index} className="vp-result-tile">
-              {s.imageUrl ? (
-                <img src={s.imageUrl} alt={s.label || `分镜 ${s.index}`} loading="lazy" />
+              {s.videoUrl ? (
+                <video src={s.videoUrl} muted controls preload="metadata" aria-label={s.label || `分镜 ${s.index}`} />
               ) : (
                 <div className="vp-result-tile-empty">无图</div>
               )}
@@ -439,12 +591,14 @@ export default function VideoPanel({
   phase,            // 'form' | 'progress' | 'result'
   job,              // 当前 video job (含 shots)
   voices,
-  imageModels,      // [{id, version, label, provider, family}]
+  llmModels,
   videoModels,
   onSubmit,         // ({prompt, options}) => Promise<void>
   submitting,       // 表单提交中
   submitError,
 }) {
+  const panelRef = useRef(null)
+
   // ESC 关闭
   useEffect(() => {
     if (!open) return undefined
@@ -453,13 +607,57 @@ export default function VideoPanel({
     return () => window.removeEventListener('keydown', onKey)
   }, [open, onClose])
 
+  // 打开：把焦点移进 dialog
+  useEffect(() => {
+    if (!open) return undefined
+    const t = window.setTimeout(() => {
+      const panel = panelRef.current
+      if (!panel) return
+      // 优先定位到描述框（form 阶段），否则取 panel 内第一个可聚焦元素
+      const preferred = panel.querySelector('.vp-textarea')
+      const target = preferred || panel.querySelector(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )
+      target?.focus()
+    }, 30)
+    return () => window.clearTimeout(t)
+  }, [open, phase])
+
+  // 最小 focus trap：Tab/Shift+Tab 在 panel 内循环
+  function onPanelKeyDown(e) {
+    if (!open) return
+    if (e.key !== 'Tab') return
+    const panel = panelRef.current
+    if (!panel) return
+    const focusables = Array.from(panel.querySelectorAll(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )).filter((el) => el.offsetParent !== null || el === document.activeElement)
+    if (focusables.length === 0) return
+    const first = focusables[0]
+    const last = focusables[focusables.length - 1]
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault()
+      last.focus()
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault()
+      first.focus()
+    }
+  }
+
   return (
     <div className={`vp-shell ${open ? 'open' : ''}`} aria-hidden={!open}>
       <div className="vp-backdrop" onClick={onClose} />
-      <aside className="vp-panel" role="dialog" aria-modal="true" aria-label="一键成片">
+      <aside
+        className="vp-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label="一键成片"
+        ref={panelRef}
+        onKeyDown={onPanelKeyDown}
+      >
         <header className="vp-head">
           <div className="vp-head-text">
-            <h3>一键成片</h3>
+            <h3 id="vp-title" tabIndex="-1">一键成片</h3>
             <p>写一段描述，自动拆镜、出图、出镜、出配音、合成。</p>
           </div>
           <button type="button" className="vp-close" onClick={onClose} aria-label="关闭">
@@ -475,7 +673,7 @@ export default function VideoPanel({
           {phase === 'form' && (
             <FormView
               voices={voices}
-              imageModels={imageModels}
+              llmModels={llmModels}
               videoModels={videoModels}
               busy={submitting}
               onSubmit={onSubmit}

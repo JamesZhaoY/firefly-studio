@@ -88,6 +88,7 @@ export function MessageBubble({ job }) {
   const reduce = useReducedMotion()
   const p = job.params || {}
   const outs = (job.outputs || job.files || []).filter((o) => o.url)
+  const isVideoPipeline = job.kind === 'video_pipeline'
   const isActive = ['queued', 'running'].includes(job.status)
   const enter = reduce ? false : { opacity: 0, y: 6 }
 
@@ -103,7 +104,7 @@ export function MessageBubble({ job }) {
           <div className="bubble-prompt">{p.prompt || job.prompt}</div>
           <div className="bubble-meta">
             <span className="meta-chip">
-              {p.model || job.model}:{p.model_version || job.model_version}
+              {(p.model || job.model || p.model_version || job.model_version) ? [p.model || job.model, p.model_version || job.model_version].filter(Boolean).join(':') : '未指定模型'}
             </span>
             {p.size && <span className="meta-chip">{p.size}</span>}
             {p.duration && <span className="meta-chip">{p.duration}s</span>}
@@ -127,7 +128,12 @@ export function MessageBubble({ job }) {
             {job.message && <span className="status-msg">{job.message}</span>}
           </div>
 
-          {isActive && (
+          {isVideoPipeline ? (
+            <div className="project-card">
+              <strong>短片生成</strong><span>{p.shot_count || job.shot_count || 0} 个镜头</span><span>{p.aspect_ratio || job.aspect_ratio || '比例未知'}</span>
+              <button type="button" className="action" onClick={() => window.dispatchEvent(new CustomEvent('open-video-job', { detail: job.id }))}>查看成片</button>
+            </div>
+          ) : isActive && (
             <div className="bar">
               <motion.i
                 initial={reduce ? false : { width: 0 }}

@@ -151,18 +151,13 @@ def _get_models_by_kind(*, force_live: bool = False) -> tuple[dict[str, list], s
     return by_kind, source, err
 
 def _auth_status() -> dict[str, Any]:
+    """登录态摘要（公网可读）。不返回绝对路径、token client_id、expires 详情。"""
     storage = Path(fp.env("FIREFLY_STORAGE", str(fp.DEFAULT_STORAGE)))
     token_file = Path(fp.env("FIREFLY_TOKEN_FILE", str(fp.DEFAULT_TOKEN_FILE)))
     info: dict[str, Any] = {
-        "storage_exists": storage.exists(),
-        "token_file_exists": token_file.exists(),
         "token_ok": False,
-        "client_id": "",
-        "expires_at": None,
-        "expires_in_sec": None,
         "can_ims_refresh": storage.exists(),
     }
-    tok = None
     if token_file.exists():
         try:
             import json
@@ -170,17 +165,12 @@ def _auth_status() -> dict[str, Any]:
             data = json.loads(token_file.read_text(encoding="utf-8"))
             tok = data.get("token")
             exp = data.get("expires_at")
-            info["expires_at"] = exp
             if exp:
-                info["expires_in_sec"] = int(float(exp) - time.time())
                 info["token_ok"] = bool(tok) and time.time() < float(exp)
             else:
                 info["token_ok"] = bool(tok)
-        except Exception as e:
-            info["error"] = str(e)
-    if tok:
-        claims = fp.decode_jwt_payload(str(tok))
-        info["client_id"] = claims.get("client_id") or ""
+        except Exception:
+            pass
     return info
 
 
@@ -260,6 +250,37 @@ def _public_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
     out["files"] = files
     out["outputs"] = job.get("outputs") or []
     return out
+
+
+def _recover_orphaned_jobs() -> int:
+    """服务启动时把上一次运行未结束的 queued / running 任务标记为 failed。
+
+    daemon thread 在 gunicorn worker 重启后会直接丢失，没有续跑能力；
+    把它们标成 failed + 「服务重启，任务中断」让用户知道要重新提交。
+    """
+    affected = 0
+    try:
+        rows = db.list_jobs(limit=500, offset=0)
+    except Exception as e:
+        sys.stderr.write(f"[startup] recover: list_jobs failed: {e}\n")
+        return 0
+    for job in rows:
+        if job.get("status") not in ("queued", "running"):
+            continue
+        try:
+            db.update_job(
+                job["id"],
+                status="failed",
+                message="服务重启，任务中断，请重新提交。",
+                progress=100,
+                finished_at=time.time(),
+            )
+            affected += 1
+        except Exception as e:
+            sys.stderr.write(f"[startup] recover: {job.get('id')} update failed: {e}\n")
+    if affected:
+        sys.stderr.write(f"[startup] recovered {affected} orphaned jobs (queued/running → failed)\n")
+    return affected
 
 # ── job runner ───────────────────────────────────────────────
 
@@ -454,13 +475,13 @@ def api_outputs(filename: str):
 
 @app.get("/api/health")
 def api_health():
+    """轻量健康检查：登录态 + 额度摘要。不暴露 DB 路径、token 元信息。"""
     return jsonify(
         {
             "ok": True,
             "auth": _auth_status(),
             "credits": _credits_status(),
             "time": time.time(),
-            "db": str(DB_PATH),
         }
     )
 
@@ -647,6 +668,31 @@ def api_voices():
     ]
     return jsonify({"voices": slim, "count": len(slim), "source": "edge" if voices else "preset"})
 
+
+@app.get("/api/llm-models")
+def api_llm_models():
+    """代理 OpenAI 兼容服务的 /v1/models，供分镜模型下拉选择。"""
+    cfg = vp._load_llm_config()
+    try:
+        response = requests.get(
+            f"{cfg.base_url}/models",
+            headers={"Authorization": f"Bearer {cfg.api_key}"},
+            timeout=cfg.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        raw = payload.get("data") if isinstance(payload, dict) else []
+        models = sorted(
+            {
+                str(item.get("id") or "").strip()
+                for item in raw
+                if isinstance(item, dict) and item.get("id")
+            }
+        )
+        return jsonify({"models": models, "count": len(models), "default": cfg.model})
+    except Exception as e:
+        return jsonify({"models": [], "count": 0, "default": cfg.model, "error": str(e)}), 502
+
 def _run_video_job(job_id: str) -> None:
     """后台跑 video_pipeline.generate_full_video，并把结果写回 SQLite。"""
     with _executor_sema:
@@ -734,12 +780,23 @@ def _run_video_job(job_id: str) -> None:
                     })
 
             errs = result.get("errors") or []
-            status = "succeeded" if final_path else ("failed" if not shots else "succeeded")
-            message = (
-                f"完成 {len(shots)} 个分镜"
-                + (f"，{round(result.get('ffprobe_duration_total') or 0, 1)}s" if final_path else "")
-                + (f"（部分失败：{len(errs)} 项）" if errs else "")
-            )
+            # 只有「最终 mp4 存在」才算 succeeded；其它统一 failed
+            final_exists = bool(final_path) and Path(final_path).is_file()
+            status = "succeeded" if final_exists else "failed"
+            if final_exists:
+                duration = result.get("ffprobe_duration_total") or 0
+                message = (
+                    f"完成 {len(shots)} 个分镜"
+                    + (f"，{round(duration, 1)}s" if duration else "")
+                    + (f"（部分失败：{len(errs)} 项）" if errs else "")
+                )
+            elif shots:
+                message = (
+                    f"分镜已生成 {len(shots)} 个，最终合成失败"
+                    + (f"（{len(errs)} 项错误）" if errs else "")
+                )
+            else:
+                message = "无有效分镜，最终视频未生成"
             db.update_job(
                 job_id,
                 status=status,
@@ -747,7 +804,7 @@ def _run_video_job(job_id: str) -> None:
                 progress=100,
                 outputs=outputs,
                 result={
-                    "final_video_path": final_path,
+                    "final_video_path": final_path if final_exists else "",
                     "manifest_path": result.get("manifest_path") or "",
                     "shots": shots,
                     "tts_segments": result.get("tts_segments") or [],
@@ -795,6 +852,36 @@ def _run_video_job(job_id: str) -> None:
                 duration_ms=(time.time() - t0) * 1000,
             )
 
+def _validate_video_options(options: dict[str, Any]) -> str | None:
+    """按已知视频模型能力校验 duration / aspect。未知模型放过。"""
+    model = str(options.get("video_model") or "").strip()
+    if not model:
+        return None
+    try:
+        by_kind, _, _ = _get_models_by_kind(force_live=False)
+        pool = (by_kind.get("video") or []) + list(VIDEO_MODELS)
+    except Exception:
+        pool = list(VIDEO_MODELS)
+    m = next((x for x in pool if x.get("id") == model), None)
+    if not m:
+        return None  # 未知模型让 fp 兜底，不在前端枚举过的也允许走
+    dur = options.get("duration_sec")
+    if dur is not None:
+        try:
+            dur_i = int(dur)
+        except (TypeError, ValueError):
+            return f"时长参数非法：{dur}"
+        allowed = m.get("durations") or []
+        if allowed and dur_i not in allowed:
+            return f"该模型不支持时长 {dur_i}s（支持：{allowed}）"
+    aspect = str(options.get("aspect_ratio") or "").strip()
+    if aspect:
+        allowed = m.get("aspect_ratios") or []
+        if allowed and aspect not in allowed:
+            return f"该模型不支持比例 {aspect}（支持：{allowed}）"
+    return None
+
+
 @app.post("/api/video/generate")
 def api_video_generate():
     """提交一条「文字 → 多镜头成片」任务；异步返回 job_id。"""
@@ -805,6 +892,10 @@ def api_video_generate():
     options = body.get("options") or {}
     if not isinstance(options, dict):
         return jsonify({"error": "options 必须是对象"}), 400
+
+    err = _validate_video_options(options)
+    if err:
+        return jsonify({"error": err}), 400
 
     auth = _auth_status()
     if not auth.get("storage_exists") and not auth.get("token_ok"):
@@ -870,6 +961,7 @@ def api_video_get(job_id: str):
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    recovered = _recover_orphaned_jobs()
     try:
         by_kind, source, err = _get_models_by_kind(force_live=False)
         total = sum(len(v) for v in by_kind.values())
@@ -877,11 +969,22 @@ def main() -> None:
     except Exception as e:
         print(f"[models] preload failed: {e}")
 
+    # CORS=* 在公网部署等于裸奔：警告
+    cors_warn = ""
+    if _cors_origins.strip() in ("", "*"):
+        cors_warn = "  ⚠ CORS_ORIGINS=* 允许任意源跨域（公网部署请改成具体前端域名）"
+    if os.environ.get("FLASK_PUBLIC") == "1":
+        cors_warn += "\n  ⚠ FLASK_PUBLIC=1：确认已通过 Tailscale / SSH Tunnel / CF Access 保护"
+
     host = fp.env("FLASK_HOST", "0.0.0.0")
     port = int(fp.env("FLASK_PORT", "7860") or 7860)
     print(f"[Firefly API] http://{host}:{port}")
     print(f"  db={DB_PATH}")
-    print(f"  cors=*  frontend: cd frontend && npm run dev")
+    print(f"  recovered_orphans={recovered}")
+    print(f"  cors={_cors_origins}")
+    if cors_warn:
+        print(cors_warn)
+    print("  frontend: cd frontend && npm run dev")
     app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
 
 if __name__ == "__main__":

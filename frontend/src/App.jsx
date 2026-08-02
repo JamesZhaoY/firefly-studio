@@ -42,8 +42,16 @@ export default function App() {
   const [videoSubmitting, setVideoSubmitting] = useState(false)
   const [videoSubmitError, setVideoSubmitError] = useState('')
   const [voices, setVoices] = useState([])
+  const [llmModels, setLlmModels] = useState([])
   const [focusJobId, setFocusJobId] = useState('')
+  const videoTriggerRef = useRef(null)
   const pollRef = useRef(null)
+
+  // 最近一条 video_pipeline 任务（按 created_at 倒序取第一条）
+  const latestVideoJobId = useMemo(() => {
+    const vp = jobs.filter((j) => j.kind === 'video_pipeline')
+    return vp[0]?.id || ''
+  }, [jobs])
 
   const allKindModels = presets[kind] || []
   const catalogModels = useMemo(
@@ -122,6 +130,15 @@ export default function App() {
     } catch { /* keep empty -> panel uses fallback */ }
   }, [])
 
+  const loadLlmModels = useCallback(async () => {
+    try {
+      const data = await api.llmModels()
+      setLlmModels(Array.isArray(data.models) ? data.models : [])
+    } catch {
+      setLlmModels([])
+    }
+  }, [])
+
   async function onClearChat() {
     if (!jobs.length) return
     if (!window.confirm(`清空对话？将删除 ${jobs.length} 个任务及其日志。`)) return
@@ -147,16 +164,69 @@ export default function App() {
   }
 
   // ── 一键成片：open / submit / poll / reset ──
-  function openVideoPanel() {
+  async function openVideoPanel(jobId) {
     setVideoSubmitError('')
-    setVideoPhase(videoJob && videoJob.status !== 'succeeded' && videoJob.status !== 'failed'
-      ? 'progress'
-      : (videoJob && videoJob.status === 'succeeded' ? 'result' : 'form'))
     setVideoOpen(true)
+    const targetId = jobId || latestVideoJobId
+    // 已有当前 videoJob 且匹配目标 ID → 沿用旧逻辑
+    if (videoJob && videoJob.id === targetId) {
+      setVideoPhase(
+        videoJob.status !== 'succeeded' && videoJob.status !== 'failed'
+          ? 'progress'
+          : 'result',
+      )
+      return
+    }
+    // 没指定 ID 且 jobs 列表里也没有 → 显示空表单
+    if (!targetId) {
+      setVideoPhase('form')
+      return
+    }
+    try {
+      const data = await api.videoJob(targetId)
+      const j = data?.job || {}
+      const finalPath = j.final_video_path || ''
+      const finalVideoUrl = finalPath
+        ? (finalPath.includes('/outputs/') ? '/outputs/' + finalPath.split('/outputs/', 2)[1] : '')
+        : ''
+      const manifestPath = j.manifest_path || ''
+      const manifestUrl = manifestPath
+        ? (manifestPath.includes('/outputs/') ? '/outputs/' + manifestPath.split('/outputs/', 2)[1] : '')
+        : ''
+      const shots = (j.shots || []).map((s) => ({
+        index: s.index,
+        label: s.label || `第 ${s.index} 镜`,
+        visual_prompt: s.visual_prompt || '',
+        narration: s.narration || '',
+        imageUrl: s.image_url || '',
+        videoUrl: s.video_url || '',
+        status: s.status || 'queued',
+        stage: s.stage || '',
+        error: s.error || '',
+      }))
+      const restored = {
+        id: targetId,
+        status: j.status || 'running',
+        progress: j.progress || 0,
+        message: j.message || '',
+        shots,
+        finalVideoUrl,
+        manifestUrl,
+        usedFfmpeg: j.used_ffmpeg,
+        ffprobeDuration: j.ffprobe_duration_total || 0,
+      }
+      setVideoJob(restored)
+      const isTerminal = j.status === 'succeeded' || j.status === 'failed'
+      setVideoPhase(isTerminal ? 'result' : 'progress')
+      if (!isTerminal) startVideoPoll(targetId)
+    } catch {
+      setVideoPhase('form')
+    }
   }
 
   function closeVideoPanel() {
     setVideoOpen(false)
+    window.setTimeout(() => videoTriggerRef.current?.focus(), 0)
   }
 
   function resetVideoPanel() {
@@ -253,15 +323,22 @@ export default function App() {
     if (pollRef.current) clearInterval(pollRef.current)
   }, [])
 
+  useEffect(() => {
+    const onOpen = (e) => { openVideoPanel(e.detail || '') }
+    window.addEventListener('open-video-job', onOpen)
+    return () => window.removeEventListener('open-video-job', onOpen)
+  }, [latestVideoJobId, videoJob])
+
   // bootstrap
   useEffect(() => {
     loadHealth()
     loadModels(false)
     loadJobs()
     loadVoices()
+    loadLlmModels()
     const t = setInterval(loadHealth, 30000)
     return () => clearInterval(t)
-  }, [loadHealth, loadModels, loadJobs, loadVoices])
+  }, [loadHealth, loadModels, loadJobs, loadVoices, loadLlmModels])
 
   // poll active jobs
   useEffect(() => {
@@ -371,6 +448,7 @@ export default function App() {
     setSelectedKey(keyOf(m))
     setKind(m.kind === 'audio' ? 'image' : m.kind || 'image')
     setPage('chat')
+    showMsg(`已选择 ${m.id}:${m.version}`, 'ok')
   }
 
   function onPickFromPicker(k) {
@@ -378,6 +456,8 @@ export default function App() {
   }
 
   function onSelectJob(jobId) {
+    const job = jobs.find((j) => j.id === jobId)
+    if (job?.kind === 'video_pipeline') { openVideoPanel(jobId); return }
     setPage('chat')
     setFocusJobId(jobId)
   }
@@ -403,7 +483,7 @@ export default function App() {
             count={`${jobs.length} 个任务`}
             right={
               <>
-                <GhostButton onClick={openVideoPanel} title="一键成片（视频生成流程）">
+                <GhostButton ref={videoTriggerRef} onClick={openVideoPanel} title="一键成片（视频生成流程）">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
                        stroke="currentColor" strokeWidth="2"
                        strokeLinecap="round" strokeLinejoin="round">
@@ -499,7 +579,7 @@ export default function App() {
         phase={videoPhase}
         job={videoJob}
         voices={voices}
-        imageModels={presets.image}
+        llmModels={llmModels}
         videoModels={presets.video}
         onSubmit={onVideoSubmit}
         submitting={videoSubmitting}

@@ -1,14 +1,15 @@
-"""全自动视频生成流水线（文字 → 多镜头脚本 → 关键帧 → 镜头 → 配音 → 合成）。
+"""全自动视频生成流水线（文字 → 多镜头脚本 → 镜头视频 → 配音 → 合成）。
 
 职责：
-  1. 把一段自然语言描述拆成 N 个分镜（3-6 镜头，纯启发式，不调 LLM）
-  2. 每个分镜：先出关键帧（image）→ 出镜头视频（video）→ 出配音（TTS）
-  3. 把所有镜头按顺序拼接，并把每段配音混进对应时间轴
-  4. 落盘 + 把结果写回 SQLite jobs 表
+  1. 把一段自然语言描述拆成 N 个分镜（3-6 镜头，纯启发式，可选 LLM）
+  2. 每个分镜：出镜头视频（video）→ 出配音（TTS，TTS 失败补静音）
+  3. 按每个镜头的最终时长（视频 / TTS / 计划 取最大）归一化视频和音频
+  4. ffmpeg 拼接 + 混音
+  5. 落盘 + 把结果写回 SQLite jobs 表
 
 外部依赖：
-  - firefly_pipeline.generate_image / generate_video （已有）
-  - https://tts.22y.workers.dev/tts  （外部 TTS，已探测接口）
+  - firefly_pipeline.generate_video （已有）
+  - edge-tts（Microsoft Edge TTS，pip 依赖）
   - 系统 ffmpeg（可选，没有则降级为 manifest 模式）
 """
 
@@ -107,7 +108,7 @@ def _count_cues(prompt: str) -> int:
 
 def _length_based_shot_count(prompt: str) -> int:
     """提示词长度 → 镜头数。
-    ≤ 40 字 → 3  短（一条社交动态）
+    ≤ 40 字 → 3  短（一句话，三个镜头视角）
     ≤ 120 字 → 4  中（产品 demo）
     ≤ 240 字 → 5  长（短广告）
     其它 → 6   超长（专题片段）
@@ -122,6 +123,58 @@ def _length_based_shot_count(prompt: str) -> int:
     return 6
 
 
+def _is_single_token(prompt: str) -> bool:
+    """特别短的提示词：≤12 字或单句，用单镜即可。"""
+    text = prompt.strip()
+    if len(text) <= 12:
+        return True
+    sentences = [s for s in re.split(r"[。！？!?\.\n]+", text) if s.strip()]
+    return len(sentences) <= 1 and len(text) <= 18
+
+
+def _short_three_views(text: str, duration_sec: int) -> list[ShotPlan]:
+    """短提示词派生 3 镜：建立 / 主体近景 / 细节。
+    三个镜头共用同一段 narration（同一时刻的三个视角），避免把字符碎片化给 TTS。
+    """
+    angles = [
+        ("establishing wide shot", "wide establishing"),
+        ("close-up on the subject", "close-up subject"),
+        ("detail close-up, shallow depth of field", "detail close-up"),
+    ]
+    per = max(int(duration_sec), 4)
+    plans: list[ShotPlan] = []
+    for i, (visual_suffix, camera) in enumerate(angles, start=1):
+        plans.append(
+            ShotPlan(
+                index=i,
+                visual_prompt=(
+                    f"{visual_suffix}: {text}. high quality, stable composition, "
+                    f"cinematic lighting, {camera}"
+                ),
+                narration=text,
+                duration_sec=per,
+                camera=camera,
+            )
+        )
+    return plans
+
+
+def _single_shot_plan(text: str, duration_sec: int) -> list[ShotPlan]:
+    """单镜：直接把整段原文当 narration + visual。"""
+    return [
+        ShotPlan(
+            index=1,
+            visual_prompt=(
+                f"single cinematic shot: {text}. high quality, stable composition, "
+                f"cinematic lighting"
+            ),
+            narration=text,
+            duration_sec=max(int(duration_sec), 4),
+            camera="single",
+        )
+    ]
+
+
 @dataclass
 class ShotPlan:
     """一个分镜的预规划（还没真去生成）。"""
@@ -130,6 +183,9 @@ class ShotPlan:
     visual_prompt: str  # 给图 / 视频用的英文式 prompt
     narration: str      # 给 TTS 的旁白（直接用原文叙述 + 标记）
     duration_sec: int   # 这个镜头在最终片长里的目标时长
+    camera: str = ""            # 镜头语言（如 "wide establishing", "close-up"）
+    motion: str = ""            # 运动描述（如 "slow dolly in"）
+    negative_prompt: str = ""   # 反向提示词
 
 
 _CUE_PATTERN = re.compile(
@@ -161,7 +217,8 @@ def _split_into_segments(prompt: str, n: int) -> list[str]:
     """把原文切成 n 段叙述。
     1. 有显式分镜提示 → 按提示符劈
     2. 句子边界 ≥ n → 按句劈
-    3. 都不够 → 按字符均分到 n 段（保留原文顺序）
+    3. 都不够 → 把整段原文当成「一段」放进最后一个镜头的 narration，
+                  之前的镜头留视觉占位（避免字符碎片化进 TTS）
     """
     text = prompt.strip()
     if not text:
@@ -180,20 +237,11 @@ def _split_into_segments(prompt: str, n: int) -> list[str]:
         tail = " ".join(parts[n - 1 :])
         return head + [tail]
 
-    # 都不够：按字符均分到 n 段
-    if len(text) <= n:
-        return [text[i:i+1] for i in range(len(text))] + [text] * (n - len(text))
-    size, rem = divmod(len(text), n)
-    out: list[str] = []
-    cursor = 0
-    for i in range(n):
-        take = size + (1 if i < rem else 0)
-        chunk = text[cursor : cursor + take].strip()
-        if not chunk:
-            chunk = text[cursor : cursor + take]
-        out.append(chunk)
-        cursor += take
-    return out
+    # ponytail: 都不够时，按字符切会产生 "猫在 / 阳光 / 下打盹" 这种碎片旁白。
+    # 改为：把整段原文集中在最后一个镜头的 narration，前面的镜头留空字符串
+    # （视觉占位由 ShotPlan.camera/motion/visual_prompt 引导，不靠 narration）。
+    blanks = [""] * (n - 1)
+    return blanks + [text]
 
 
 def split_storyboard(
@@ -210,9 +258,14 @@ def split_storyboard(
         return []
 
     if shot_count is None:
+        if _is_single_token(text):
+            return _single_shot_plan(text, duration_sec)
         explicit = _count_cues(text)
         if explicit >= MIN_SHOTS:
             n = min(explicit, MAX_SHOTS)
+        elif len(text) <= 40:
+            # 短提示词：走三视图派生，避免按字符切
+            return _short_three_views(text, duration_sec)
         else:
             n = _length_based_shot_count(text)
     else:
@@ -223,12 +276,12 @@ def split_storyboard(
     for i, seg in enumerate(segments, start=1):
         label = _shot_label(i, n)
         # visual_prompt: 用原片段描述 + 镜头序号引导，避免原样复制
-        visual = f"{label} cinematic shot: {seg}. high quality, stable composition, cinematic lighting"
+        visual = f"{label} cinematic shot: {seg or text}. high quality, stable composition, cinematic lighting"
         plans.append(
             ShotPlan(
                 index=i,
                 visual_prompt=visual,
-                narration=seg,
+                narration=seg,  # 空白 narration → generate_shot_tts 会抛 TTSError，被 silence 兜底
                 duration_sec=int(duration_sec),
             )
         )
@@ -272,11 +325,16 @@ def _load_llm_config() -> LLMConfig:
 
 _SYSTEM_PROMPT = (
     "你是一名分镜师。用户给一段自然语言描述,你把它拆成 N 个分镜"
-    "(N 由用户指定,3-6)。每个分镜输出:\n"
-    "- visual: 一行适合图像生成的视觉提示词(英文)\n"
-    "- narration: 一行该镜头的旁白(中文)\n"
-    "- duration: 整数秒\n"
-    "输出 JSON 数组,字段 visual/narration/duration。"
+    "(N 由用户指定,3-6)。每个分镜必须输出 JSON 对象,字段:\n"
+    "- visual: 一行适合图像生成的视觉提示词(纯英文,无中文字符)\n"
+    "- narration: 一行该镜头的旁白(中文,保留用户语言)\n"
+    "- duration: 整数秒(3-12)\n"
+    "- camera: 镜头语言(如 wide establishing / close-up / dolly in)\n"
+    "- motion: 运动描述(如 slow dolly in / static / pan right)\n"
+    "- negative_prompt: 反向提示词(英文,空字符串表示无)\n"
+    "要求: 各镜头的 visual 必须有明显视觉变化(景别/角度/主体不同), "
+    "禁止用同一段 prompt 改几个字。\n"
+    "输出严格 JSON 数组,字段 visual/narration/duration/camera/motion/negative_prompt。"
 )
 
 
@@ -338,7 +396,15 @@ def _coerce_shot(item: Any, *, idx: int, default_duration: int) -> ShotPlan | No
     except (TypeError, ValueError):
         dur = int(default_duration)
     dur = max(3, min(12, dur))  # 夹到 [3, 12]
-    return ShotPlan(index=idx, visual_prompt=visual, narration=narration, duration_sec=dur)
+    return ShotPlan(
+        index=idx,
+        visual_prompt=visual,
+        narration=narration,
+        duration_sec=dur,
+        camera=str(item.get("camera") or "").strip(),
+        motion=str(item.get("motion") or "").strip(),
+        negative_prompt=str(item.get("negative_prompt") or "").strip(),
+    )
 
 
 def _call_llm_chat(
@@ -504,42 +570,133 @@ def probe_duration(path: Path, *, ffprobe_bin: str | None = None) -> float:
         return 0.0
 
 
+def _ffmpeg_bin_or_raise(ffmpeg_bin: str | None) -> str:
+    bin_ = ffmpeg_bin or ffmpeg_available()
+    if not bin_:
+        raise RuntimeError("ffmpeg 不可用")
+    return bin_
+
+
+def _extract_thumbnail(video: Path, out: Path, *, ffmpeg_bin: str | None = None) -> Path | None:
+    """从视频抽第一帧为 jpg；失败返回 None（不影响主流程）。"""
+    bin_ = _ffmpeg_bin_or_raise(ffmpeg_bin)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cmd = [bin_, "-y", "-i", str(video), "-vframes", "1", "-an", "-q:v", "3", str(out)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            sys.stderr.write(f"[video_pipeline] thumb extract failed: {proc.stderr[-500:]}\n")
+            return None
+        return out
+    except Exception as e:
+        sys.stderr.write(f"[video_pipeline] thumb extract exception: {e}\n")
+        return None
+
+
+def _silence_for_duration(dur_sec: float, out: Path, *, ffmpeg_bin: str | None = None) -> Path:
+    """生成 dur_sec 秒的静音 mp3。"""
+    bin_ = _ffmpeg_bin_or_raise(ffmpeg_bin)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    dur = max(float(dur_sec), 0.1)
+    cmd = [
+        bin_, "-y",
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-t", f"{dur}",
+        "-c:a", "libmp3lame", "-b:a", "64k",
+        str(out),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr[-1000:] + "\n")
+        raise RuntimeError(f"生成静音失败 (code={proc.returncode})")
+    return out
+
+
+def _normalize_clip(clip: Path, target_dur: float, out: Path, *, ffmpeg_bin: str | None = None) -> Path:
+    """视频归一化：
+      - 视频短于 target_dur → 冻结最后一帧补齐（tpad clone）
+      - 视频长于 target_dur → 裁剪到 target_dur（-t）
+      - 分辨率取偶数像素，固定 fps=24，yuv420p
+
+    实现：tpad 加 target_dur 秒的冻结尾帧，再由 `-t target_dur` 截到精确时长。
+    这样无论输入比 target 短 / 长 / 相等，输出都恰好 target_dur 秒。
+    """
+    bin_ = _ffmpeg_bin_or_raise(ffmpeg_bin)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    dur = max(float(target_dur), 0.1)
+    vf = (
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2:force_original_aspect_ratio=decrease,"
+        "pad=iw:ih:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
+        "fps=24,"
+        f"tpad=stop_mode=clone:stop_duration={dur},"
+        "format=yuv420p,trim=end={d},setpts=PTS-STARTPTS"
+    ).format(d=dur)
+    cmd = [
+        bin_, "-y",
+        "-i", str(clip),
+        "-vf", vf,
+        "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-t", f"{dur}",
+        "-movflags", "+faststart",
+        str(out),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr[-1500:] + "\n")
+        raise RuntimeError(f"视频归一化失败 (code={proc.returncode})")
+    return out
+
+
+def _normalize_audio(audio: Path, target_dur: float, out: Path, *, ffmpeg_bin: str | None = None) -> Path:
+    """音频归一化：短了补静音（apad），长了裁剪（atrim），统一 44.1kHz 立体声。"""
+    bin_ = _ffmpeg_bin_or_raise(ffmpeg_bin)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    dur = max(float(target_dur), 0.1)
+    seg_ms = int(round(dur * 1000))
+    af = (
+        "aresample=44100,"
+        f"apad=whole_dur={seg_ms}ms,"
+        f"atrim=end={dur},asetpts=PTS-STARTPTS"
+    )
+    cmd = [
+        bin_, "-y",
+        "-i", str(audio),
+        "-af", af,
+        "-c:a", "libmp3lame", "-b:a", "96k",
+        "-t", f"{dur}",
+        str(out),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr[-1500:] + "\n")
+        raise RuntimeError(f"音频归一化失败 (code={proc.returncode})")
+    return out
+
+
 def concat_with_audio(
     clips: list[Path],
     audios: list[Path],
     *,
     output: Path,
-    shot_durations: list[float] | None = None,
     ffmpeg_bin: str | None = None,
 ) -> Path:
-    """把所有镜头按顺序拼起来，并把每段配音按 offset 混进时间轴。
+    """把所有镜头按顺序拼接并混音。
 
-    clips / audios 同长度；shot_durations 给的是「这个镜头在最终片长里占几秒」，
-    缺省用每个 clip 实际 ffprobe 时长。
+    约定：调用方已把 clips / audios 归一化到相同的目标时长；
+    本函数不再 probe / pad / trim，只做 concat + amix。
     """
     bin_ = ffmpeg_bin or ffmpeg_available()
     if not bin_:
         raise RuntimeError("ffmpeg 不可用")
 
     n = len(clips)
-    assert len(audios) == n, "clips / audios 数量必须一致"
-
-    # 先用 input 把每个 clip 拉到统一时长（避免 concat 因 fps 不一致炸）
-    # 然后 concat 所有 normalized clip；audio 单独 pad + delay + amix
-    seg_lens: list[float] = []
-    for i, clip in enumerate(clips):
-        d = (shot_durations[i] if shot_durations and shot_durations[i] else 0.0)
-        if d <= 0:
-            d = probe_duration(clip)
-        seg_lens.append(max(d, 0.1))
-
-    # 第一段 offset = 0ms, 之后累加
-    offsets_ms: list[int] = []
-    cursor = 0
-    for d in seg_lens[:-1]:
-        offsets_ms.append(cursor)
-        cursor += int(round(d * 1000))
-    offsets_ms.append(cursor)  # 最后一段不算
+    if n == 0:
+        raise RuntimeError("没有可拼接的镜头")
+    if len(audios) != n:
+        # ponytail: 上层应保证每镜都有归一化音频（含 silence fallback）；
+        # 漏一个就 raise，让调用方回退到 manifest 模式而不是伪装成功
+        raise RuntimeError(f"audios 数 ({len(audios)}) 与 clips 数 ({n}) 不一致")
 
     inputs: list[str] = []
     for c in clips:
@@ -548,43 +705,25 @@ def concat_with_audio(
         inputs.extend(["-i", str(a)])
 
     fc_parts: list[str] = []
-    # 先 normalize 每个视频流到 yuv420p / 统一 fps，避免 concat 失败
-    # concat filter 本身要求各输入同分辨率 / 像素格式，所以这里先 scale+pad+setpts
-    norm_labels: list[str] = []
+    # 视频：clip 已归一化（yuv420p / fps=24 / SAR=1），concat 仅做拼接
+    v_labels = [f"v{i}" for i in range(n)]
     for i in range(n):
-        lbl = f"v{i}"
-        fc_parts.append(
-            f"[{i}:v]scale=trunc(iw/2)*2:trunc(ih/2)*2:force_original_aspect_ratio=decrease,"
-            f"pad=iw:ih:(ow-iw)/2:(oh-ih)/2:color=black,"
-            f"setsar=1,fps=24,format=yuv420p[{lbl}]"
-        )
-        norm_labels.append(lbl)
+        fc_parts.append(f"[{i}:v]format=yuv420p[{v_labels[i]}]")
+    concat_in = "".join(f"[{l}]" for l in v_labels)
+    fc_parts.append(f"{concat_in}concat=n={n}:v=1:a=0[v]")
 
-    concat_inputs = "".join(f"[{l}]" for l in norm_labels)
-    fc_parts.append(
-        f"{concat_inputs}concat=n={n}:v=1:a=0[cv]"
-    )
-
-    # audio: pad 到对应镜头时长，adelay 偏移，amix
-    audio_labels: list[str] = []
+    # 音频：amix 所有归一化后的音轨（已 resample + 对齐到目标时长）
+    a_labels = [f"a{i}" for i in range(n)]
     for i in range(n):
-        lbl = f"a{i}"
-        seg_ms = int(round(seg_lens[i] * 1000))
-        fc_parts.append(
-            f"[{n + i}:a]apad=whole_dur={seg_ms}ms[a{i}_p];"
-            f"[a{i}_p]adelay={offsets_ms[i]}|all=1[{lbl}]"
-        )
-        audio_labels.append(lbl)
-    mix_inputs = "".join(f"[{l}]" for l in audio_labels)
-    fc_parts.append(
-        f"{mix_inputs}amix=inputs={n}:duration=first:dropout_transition=0[a]"
-    )
+        fc_parts.append(f"[{n + i}:a]aresample=44100[{a_labels[i]}]")
+    mix_in = "".join(f"[{l}]" for l in a_labels)
+    fc_parts.append(f"{mix_in}amix=inputs={n}:duration=first:dropout_transition=0[a]")
 
     cmd: list[str] = [
         bin_, "-y",
         *inputs,
         "-filter_complex", ";".join(fc_parts),
-        "-map", "[cv]",
+        "-map", "[v]",
         "-map", "[a]",
         "-c:v", "libx264",
         "-preset", "veryfast",
@@ -594,7 +733,7 @@ def concat_with_audio(
         "-movflags", "+faststart",
         str(output),
     ]
-    print("[ffmpeg] " + " ".join(cmd[:8]) + f" ... → {output.name}", file=sys.stderr)
+    print(f"[ffmpeg] concat {n} clips → {output.name}", file=sys.stderr)
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr[-2000:] + "\n")
@@ -610,14 +749,14 @@ class TTSError(RuntimeError):
 
 
 class TTSClient:
-    """Microsoft Edge TTS。"""
+    """Microsoft Edge TTS（通过 edge-tts Python 包）。"""
 
     def __init__(
         self,
-        timeout: int = TTS_TIMEOUT,
+        timeout: float = float(TTS_TIMEOUT),
         voice: str = TTS_DEFAULT_VOICE,
     ) -> None:
-        self.timeout = timeout
+        self.timeout = float(timeout)
         self.voice = voice
 
     def list_voices(self) -> list[dict[str, Any]]:
@@ -641,7 +780,18 @@ class TTSClient:
             import edge_tts
 
             output.parent.mkdir(parents=True, exist_ok=True)
-            asyncio.run(edge_tts.Communicate(text, chosen).save(str(output)))
+            communicate = edge_tts.Communicate(text, chosen)
+            # edge-tts 没有原生 timeout；用 asyncio.wait_for 包一层
+            try:
+                asyncio.run(
+                    asyncio.wait_for(communicate.save(str(output)), timeout=self.timeout)
+                )
+            except asyncio.TimeoutError as e:
+                raise TTSError(
+                    f"Edge TTS 超时（>{self.timeout:.0f}s），请稍后重试"
+                ) from e
+        except TTSError:
+            raise
         except Exception as e:
             raise TTSError(f"Edge TTS 失败: {e}") from e
         return output
@@ -728,11 +878,7 @@ def generate_shot_video(
     *,
     work: Path,
 ) -> tuple[str, Path | None]:
-    """调 fp.generate_video，下载到 work/<name>.<ext>。
-    当前上游接口对 image-to-video 走 reference_blobs（要先上传图片拿 blob id），
-    为了不让这条路径爆炸，v1 直接用同一段 visual_prompt 跑 text-to-video；
-    关键帧图仍然保留下来（poster / 后续切换）。
-    """
+    """调 fp.generate_video（纯文生视频），下载到 work/<name>.<ext>。"""
     work.mkdir(parents=True, exist_ok=True)
     aspect = options.aspect_ratio or DEFAULT_ASPECT_RATIO
     size = dict(
@@ -748,7 +894,7 @@ def generate_shot_video(
         size=size,
         aspect_ratio=aspect,
         generate_audio=options.generate_audio,
-        negative_prompt="",
+        negative_prompt=plan.negative_prompt or "",
         poll_interval=options.poll_interval,
         max_wait=options.max_wait,
         download_dir=work,
@@ -780,6 +926,24 @@ def _media_duration_sec(path: Path | None) -> float:
     if not path:
         return 0.0
     return probe_duration(path)
+
+
+def resolve_final_duration(
+    plan_duration_sec: int | float,
+    video_duration_sec: float,
+    audio_duration_sec: float,
+    *,
+    floor: float = 0.5,
+) -> float:
+    """一个镜头在最终成片里的目标时长 = max(视频实测, TTS 实测, 计划, 下限)。
+    抽出便于单测。
+    """
+    return max(
+        float(video_duration_sec or 0),
+        float(audio_duration_sec or 0),
+        float(plan_duration_sec or 0),
+        float(floor),
+    )
 
 
 def generate_full_video(
@@ -855,6 +1019,8 @@ def generate_full_video(
     tts_root = TTS_DIR / job_id if job_id else (TTS_DIR / _stamp())
     job_root.mkdir(parents=True, exist_ok=True)
     tts_root.mkdir(parents=True, exist_ok=True)
+    tmp_root = job_root / "tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
 
     tts = TTSClient(voice=options.voice)
     shots = [Shot(plan=plan) for plan in plans]
@@ -871,20 +1037,13 @@ def generate_full_video(
     span = 80.0  # 5 → 85 给镜头生成
     for i, shot in enumerate(shots, start=1):
         plan = shot.plan
-        shot_work = job_root / f"shot_{i:02d}"
-        shot.status, shot.stage = "running", "keyframe"
-        publish(f"分镜 {i}/{n}：出关键帧")
-        if on_progress:
-            on_progress(base + span * (i - 1) / n, f"分镜 {i}/{n}：出关键帧")
-        # 1) image
-        try:
-            shot.image_url, shot.image_path = generate_shot_image(plan, options, work=shot_work)
-        except Exception as e:
-            shot.error += f"image:{type(e).__name__}:{e}; "
-            errors.append(f"shot{i}.image: {e}")
-        shot.stage = "video"
+        shot_work = tmp_root / f"shot_{i:02d}"
+        shot_work.mkdir(parents=True, exist_ok=True)
+        shot.status, shot.stage = "running", "video"
         publish(f"分镜 {i}/{n}：生成视频")
-        # 2) video
+        if on_progress:
+            on_progress(base + span * (i - 1) / n, f"分镜 {i}/{n}：生成视频")
+        # 1) video（不做关键帧；缩略图后续从视频首帧抽）
         try:
             shot.video_url, shot.video_path = generate_shot_video(plan, options, work=shot_work)
         except Exception as e:
@@ -892,7 +1051,7 @@ def generate_full_video(
             errors.append(f"shot{i}.video: {e}")
         shot.stage = "tts"
         publish(f"分镜 {i}/{n}：合成配音")
-        # 3) tts
+        # 2) tts（失败不中断，silence 兜底）
         try:
             shot.audio_path = generate_shot_tts(plan, client=tts, work=tts_root / f"shot_{i:02d}")
         except Exception as e:
@@ -901,6 +1060,11 @@ def generate_full_video(
         # 时长探测
         shot.video_duration_sec = _media_duration_sec(shot.video_path)
         shot.audio_duration_sec = _media_duration_sec(shot.audio_path)
+        # 缩略图：成功生成视频后从首帧抽；不调 image 模型
+        if shot.video_path:
+            thumb = shot_work / "thumb.jpg"
+            if _extract_thumbnail(shot.video_path, thumb):
+                shot.image_path = thumb
         shot.status = "failed" if shot.error and not shot.video_path else "succeeded"
         shot.stage = "done"
         publish(f"分镜 {i}/{n}：{'完成' if shot.status == 'succeeded' else '部分失败'}")
@@ -910,12 +1074,54 @@ def generate_full_video(
     manifest_path = job_root / "manifest.json"
     used_ffmpeg = False
 
-    clips_ok = [s.video_path for s in shots if s.video_path]
-    audio_ok = [s.audio_path for s in shots if s.video_path and s.audio_path]
-    shot_durs = [s.video_duration_sec for s in shots if s.video_path]
+    # 收集成功视频镜头 → 归一化到「最终时长」(max 视频 / TTS / 计划)
+    final_clips: list[Path] = []
+    final_audios: list[Path] = []
+    final_durations: list[float] = []
 
-    if not clips_ok:
-        # 一个镜头都没成功：写 manifest 让前端至少能看见进度
+    for shot in shots:
+        if not shot.video_path:
+            continue
+        target = resolve_final_duration(
+            shot.plan.duration_sec,
+            shot.video_duration_sec,
+            shot.audio_duration_sec,
+        )
+        idx = shot.plan.index
+        clip_norm = tmp_root / f"shot_{idx:02d}" / "norm.mp4"
+        try:
+            _normalize_clip(shot.video_path, target, clip_norm)
+        except Exception as e:
+            errors.append(f"shot{idx}.normalize_clip: {e}")
+            continue
+
+        if shot.audio_path:
+            audio_norm = tts_root / f"shot_{idx:02d}" / "norm.mp3"
+            try:
+                _normalize_audio(shot.audio_path, target, audio_norm)
+                final_audio = audio_norm
+            except Exception as e:
+                errors.append(f"shot{idx}.normalize_audio: {e}")
+                final_audio = None
+        else:
+            final_audio = None
+
+        if final_audio is None:
+            silence = tts_root / f"shot_{idx:02d}" / "silence.mp3"
+            try:
+                _silence_for_duration(target, silence)
+                final_audio = silence
+            except Exception as e:
+                errors.append(f"shot{idx}.silence: {e}")
+                continue
+
+        final_clips.append(clip_norm)
+        final_audios.append(final_audio)
+        final_durations.append(target)
+        shot.stage = "concatenated"
+
+    if not final_clips:
+        # 一个镜头都没法合成：写 manifest 让前端至少能看见进度
         _write_manifest(manifest_path, prompt, options, plans, shots, final_path=None)
         return {
             "final_video_path": "",
@@ -947,12 +1153,7 @@ def generate_full_video(
         on_progress(90.0, "拼接 + 混音中…")
     publish("所有分镜完成，正在拼接 + 混音")
     try:
-        concat_with_audio(
-            clips_ok, audio_ok,
-            output=final_path,
-            shot_durations=shot_durs,
-            ffmpeg_bin=bin_,
-        )
+        concat_with_audio(final_clips, final_audios, output=final_path, ffmpeg_bin=bin_)
         used_ffmpeg = True
     except Exception as e:
         errors.append(f"concat: {e}")

@@ -1,6 +1,8 @@
 // primitives: shared controls and small visual elements.
 // No state, props-only. Used by chat / explore / logs.
 
+import { forwardRef } from 'react'
+
 export function ChipSelect({ label, value, options, onChange, suffix }) {
   return (
     <label className="chip-control param-select">
@@ -63,9 +65,13 @@ export function Suggestion({ prompt, onPick }) {
   )
 }
 
-export function GhostButton({ children, danger, disabled, onClick, title, ariaLabel }) {
+export const GhostButton = forwardRef(function GhostButton(
+  { children, danger, disabled, onClick, title, ariaLabel },
+  ref,
+) {
   return (
     <button
+      ref={ref}
       type="button"
       className={`ghost-btn ${danger ? 'danger' : ''}`}
       onClick={onClick}
@@ -76,4 +82,4 @@ export function GhostButton({ children, danger, disabled, onClick, title, ariaLa
       {children}
     </button>
   )
-}
+})

@@ -45,7 +45,7 @@ COPY tests/ ./tests/
 COPY --from=frontend /web/dist /web/frontend/dist
 
 # Persistent data + outputs
-RUN mkdir -p /data /app/outputs
+RUN mkdir -p /app/data /app/outputs
 
 # nginx config: serve static + reverse-proxy /api/* to gunicorn
 COPY nginx.conf /etc/nginx/nginx.conf
@@ -56,12 +56,14 @@ EXPOSE 19999
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 --start-period=20s \
     CMD wget --quiet --spider http://127.0.0.1:19999/api/health || exit 1
 
-# Single entrypoint: nginx (background) + gunicorn (foreground)
+# Single entrypoint: nginx (background) + gunicorn (foreground, 1 worker)
+# ponytail: threading.Semaphore(2) only works inside ONE process.
+# 多 worker 时 semaphore 会失效 → 并发任务 > 2。统一单 worker，简单可证。
 CMD ["sh", "-c", "\
   set -e; \
-  mkdir -p /data; \
-  if [ -n \"$STORAGE_JSON\" ]; then printf '%s' \"$STORAGE_JSON\" > /data/storage.json; fi; \
-  if [ -n \"$TOKEN_JSON\" ]; then printf '%s' \"$TOKEN_JSON\" > /data/current_token.json; fi; \
+  mkdir -p /app/data; \
+  if [ -n \"$STORAGE_JSON\" ]; then printf '%s' \"$STORAGE_JSON\" > /app/data/storage.json; fi; \
+  if [ -n \"$TOKEN_JSON\" ]; then printf '%s' \"$TOKEN_JSON\" > /app/data/current_token.json; fi; \
   nginx; \
-  exec gunicorn -w 2 -k gthread --threads 4 --timeout 600 \
+  exec gunicorn -w 1 -k gthread --threads 4 --timeout 600 \
     --bind 127.0.0.1:19998 wsgi:app"]

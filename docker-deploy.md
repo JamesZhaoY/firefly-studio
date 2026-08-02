@@ -1,5 +1,21 @@
 # Docker 部署 + Cloudflare 转发
 
+> ## ⚠️ 公网部署安全提示（必读）
+>
+> **不要直接把 19999 暴露在公网上。**
+>
+> 当前镜像默认假设通过 Tailscale / SSH Tunnel / Cloudflare Tunnel + Access 访问。
+> 如果一定要在公网直开 19999：
+>
+> 1. 在 `nginx.conf` 里给 `/api/*` 加 Basic Auth 或客户端证书
+> 2. 把 `CORS_ORIGINS` 改成具体的前端域名（不要留 `*`）
+> 3. 配 Cloudflare Access / oauth2-proxy 之类做应用层鉴权
+>
+> `/api/generate` / `/api/video/generate` 没有鉴权 → 任何能访问到的人都会消耗你的
+> Adobe 额度。`/outputs/*` 没鉴权 → 任何人都能下载成片 / 关键帧。
+>
+> 如果你的部署有公网 IP，请至少加一层 CF Access（按邮箱授权）。
+
 ## 架构
 
 **单容器架构**（你要求的方案）：Nginx 在 19999 同时服务前端静态 + 反向代理 `/api/*` 到同容器内的 Gunicorn。出口 Adobe 流量走 WARP sidecar。

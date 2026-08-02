@@ -8,6 +8,17 @@ name: firefly-studio
 #                                                              └─ curl_cffi → WARP → CF → Adobe
 #
 # WARP is a sidecar; api container shares its network stack.
+#
+# ── 安全提示 ────────────────────────────────────────────────
+# 默认部署不应在公网直接暴露 19999：
+#   * 19999 直接暴露 → /api/generate 可被任意人调用消耗账号额度
+#   * 19999 直接暴露 → /outputs/* 可读取任务产物
+# 推荐接入方式：
+#   1) Tailscale / SSH Tunnel / WireGuard
+#   2) Cloudflare Tunnel + CF Access（按邮箱/SSO 授权）
+#   3) Cloudflare Access / Authentik / oauth2-proxy + 反向代理
+# 若必须公网开放，请同步在 nginx.conf 里加 Basic Auth，并把 CORS_ORIGINS
+# 改成具体前端域名（不要留 *）。
 
 services:
   app:
@@ -21,7 +32,9 @@ services:
     volumes:
       # Persistent Adobe credentials + SQLite. Mount a host dir so the DB
       # survives `docker compose down` / `docker rm`.
-      - ./data:/data
+      # 应用读取 /app/data/*（firefly_pipeline.DEFAULT_STORAGE/TOKEN_FILE），
+      # 镜像启动脚本也写 /app/data/*。挂 /app/data 而不是 /data。
+      - ./data:/app/data
       - ./outputs:/app/outputs
     # All outbound traffic (curl_cffi → Adobe) goes through the WARP sidecar.
     network_mode: "service:warp"
@@ -37,7 +50,18 @@ services:
       FLASK_DEBUG: "0"
       PYTHONUNBUFFERED: "1"
       # CORS — set to your actual frontend origin (or * for testing).
+      # 公网部署请改成具体前端域名，例如 https://firefly.example.com
       CORS_ORIGINS: "*"
+      # 容器内 127.0.0.1 指向自身；本地 LLM 在宿主机时走 Docker Desktop 网关。
+      # 使用 host.docker.internal 而不是自定义 host.llm：CLIProxyAPI 只绑 127.0.0.1，
+      # 必须能从容器到达宿主机回环地址。Docker Desktop 把 host.docker.internal 解析到
+      # 宿主机 gateway（macOS / Windows；Linux 在 extra_hosts 中额外添加 host-gateway）。
+      LLM_BASE_URL: "http://host.docker.internal:8317/v1"
+      LLM_API_KEY: "local-dev-key"
+      LLM_MODEL: "gpt-5.5"
+      # 本机 LLM 不应经过 WARP / 代理。
+      NO_PROXY: "localhost,127.0.0.1,host.docker.internal,host.llm"
+      no_proxy: "localhost,127.0.0.1,host.docker.internal,host.llm"
       # Adobe credentials (paste full JSON contents as single line)
       STORAGE_JSON: ""
       TOKEN_JSON: ""
@@ -49,6 +73,12 @@ services:
     image: caomingjun/warp:latest
     container_name: firefly-warp
     restart: unless-stopped
+    extra_hosts:
+      # app 共享 WARP 网络命名空间，宿主机 LLM 别名必须定义在这里。
+      - "host.llm:host-gateway"
+      # Docker Desktop 在 macOS / Windows 上自动解析 host.docker.internal；
+      # Linux 走 host-gateway 才有效，这里显式声明兼容两种环境。
+      - "host.docker.internal:host-gateway"
     ports:
       # App shares WARP's network namespace; expose the public port here.
       - "19999:19999"
