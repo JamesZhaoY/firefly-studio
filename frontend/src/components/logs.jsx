@@ -18,6 +18,7 @@ export function LogRow({ log }) {
           {log.status_code ?? '-'}
         </span>
       </div>
+      {log.error && <p className="log-error">{log.error}</p>}
       {(log.request_body || log.response_body) && (
         <details className="log-details">
           <summary>查看载荷</summary>

@@ -7,6 +7,7 @@ import { Sidebar, Topbar } from './components/chrome.jsx'
 import { Thread, Composer } from './components/chat.jsx'
 import { ExplorePage } from './components/explore.jsx'
 import { LogsPage } from './components/logs.jsx'
+import { AccountsPage } from './components/accounts.jsx'
 import { GhostButton } from './components/primitives.jsx'
 import VideoPanel from './components/video.jsx'
 import { keyOf, SIZE_FALLBACK } from './components/util.js'
@@ -34,6 +35,11 @@ export default function App() {
   const [jobs, setJobs] = useState([])
   const [logs, setLogs] = useState([])
   const [paramsOpen, setParamsOpen] = useState(false)
+
+  // ── accounts pool ──
+  const [accounts, setAccounts] = useState([])
+  const [poolSummary, setPoolSummary] = useState(null)
+  const [accountBusy, setAccountBusy] = useState(false)
 
   // ── 一键成片 slide-over state ──
   const [videoOpen, setVideoOpen] = useState(false)
@@ -116,6 +122,18 @@ export default function App() {
     catch (e) { showMsg(e.message, 'err') }
   }, [showMsg])
 
+  const loadAccounts = useCallback(async () => {
+    try {
+      const data = await api.accounts()
+      setAccounts(data.accounts || [])
+      setPoolSummary(data.pool || null)
+    } catch {
+      // 没启动 pool 也允许 UI 退化, 不刷错误消息
+      setAccounts([])
+      setPoolSummary(null)
+    }
+  }, [])
+
   const loadVoices = useCallback(async () => {
     try {
       const data = await api.voices()
@@ -160,6 +178,74 @@ export default function App() {
       showMsg('日志已清空', 'ok')
     } catch (e) {
       showMsg(`清空失败：${e.message}`, 'err')
+    }
+  }
+
+  async function onUploadAccount({ label, tokenFile, cookieFile }) {
+    setAccountBusy(true)
+    try {
+      await api.uploadAccount({ label, tokenFile, cookieFile })
+      await loadAccounts()
+    } finally {
+      setAccountBusy(false)
+    }
+  }
+
+  async function onToggleAccount(id, disabled) {
+    setAccountBusy(true)
+    try {
+      await api.patchAccount(id, { disabled })
+      await loadAccounts()
+      showMsg(disabled ? '已停用' : '已启用', 'ok')
+    } catch (e) {
+      showMsg(e.message, 'err')
+    } finally {
+      setAccountBusy(false)
+    }
+  }
+
+  async function onRenameAccount(id, newLabel) {
+    setAccountBusy(true)
+    try {
+      await api.patchAccount(id, { label: newLabel })
+      await loadAccounts()
+      showMsg('已重命名', 'ok')
+    } catch (e) {
+      showMsg(e.message, 'err')
+    } finally {
+      setAccountBusy(false)
+    }
+  }
+
+async function onDeleteAccount(id) {
+    if (!window.confirm('删除该账号? 该账号的文件会从 data/accounts/ 删除.')) return
+    setAccountBusy(true)
+    try {
+      await api.deleteAccount(id)
+      await loadAccounts()
+      showMsg('已删除', 'ok')
+    } catch (e) {
+      showMsg(e.message, 'err')
+    } finally {
+      setAccountBusy(false)
+    }
+  }
+
+  async function onRefreshAccount(id) {
+    setAccountBusy(true)
+    try {
+      const data = await api.refreshAccount(id)
+      if (data.ok) {
+        showMsg('IMS 刷新成功', 'ok')
+      } else {
+        showMsg(data.error || '刷新失败', 'err')
+      }
+      await loadAccounts()
+    } catch (e) {
+      showMsg(e.message, 'err')
+      await loadAccounts()
+    } finally {
+      setAccountBusy(false)
     }
   }
 
@@ -336,9 +422,15 @@ export default function App() {
     loadJobs()
     loadVoices()
     loadLlmModels()
+    loadAccounts()
     const t = setInterval(loadHealth, 30000)
     return () => clearInterval(t)
-  }, [loadHealth, loadModels, loadJobs, loadVoices, loadLlmModels])
+  }, [loadHealth, loadModels, loadJobs, loadVoices, loadLlmModels, loadAccounts])
+
+  // refresh accounts page when opened
+  useEffect(() => {
+    if (page === 'accounts') loadAccounts()
+  }, [page, loadAccounts])
 
   // poll active jobs
   useEffect(() => {
@@ -469,8 +561,9 @@ export default function App() {
         setPage={setPage}
         jobs={jobs}
         logs={logs}
-         auth={auth}
-         credits={credits}
+        accounts={accounts}
+        auth={auth}
+        credits={credits}
         modelInfo={modelInfo}
         onRefreshModels={() => loadModels(true)}
         onSelectJob={onSelectJob}
@@ -524,7 +617,7 @@ export default function App() {
             filtered={filtered}
             total={allKindModels.length}
             filter={filter} setFilter={setFilter}
-            selectedKey={selectedKey} onPickFromPicker={onPickFromPicker}
+            selectedKey={selectedKey} onPickModel={onPickFromPicker}
             n={n}
             setSize={setSize} setDetail={setDetail} setN={setN}
             setDuration={setDuration} setAspect={setAspect} setAudio={setAudio} setSeeds={setSeeds}
@@ -570,6 +663,31 @@ export default function App() {
             }
           />
           <LogsPage logs={logs} />
+        </main>
+      )}
+
+      {page === 'accounts' && (
+        <main className="main">
+          <Topbar
+            title="账号池"
+            count={poolSummary
+              ? `${poolSummary.available} / ${poolSummary.size} 可用`
+              : `${accounts.length} 个账号`}
+            right={
+              <GhostButton onClick={loadAccounts} title="刷新">刷新</GhostButton>
+            }
+          />
+          <AccountsPage
+            accounts={accounts}
+            pool={poolSummary}
+            busy={accountBusy}
+            onUpload={onUploadAccount}
+            onToggle={onToggleAccount}
+            onDelete={onDeleteAccount}
+            onRefresh={onRefreshAccount}
+            onRename={onRenameAccount}
+            showMsg={showMsg}
+          />
         </main>
       )}
 

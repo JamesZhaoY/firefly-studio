@@ -286,7 +286,6 @@ function ModelPicker({ filtered, filter, setFilter, total, selectedKey, onPick }
               role="option"
               aria-selected={active}
               className={`picker-row ${active ? 'active' : ''}`}
-              onPointerDown={(e) => e.preventDefault()}
               onClick={() => onPick(k)}
             >
               <span className="picker-row-mark" aria-hidden="true" />
@@ -398,6 +397,16 @@ export function Composer(props) {
     selectedKey, onPickModel,
     setSize, setDetail, setN, setDuration, setAspect, setAudio, setSeeds,
   } = props
+  const composerRef = useRef(null)
+
+  useEffect(() => {
+    if (!paramsOpen) return undefined
+    function closeOnOutsidePointer(event) {
+      if (!composerRef.current?.contains(event.target)) setParamsOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer)
+  }, [paramsOpen, setParamsOpen])
 
   function onKey(e) {
     if (e.key === 'Enter' && !e.shiftKey && (e.metaKey || e.ctrlKey)) {
@@ -408,7 +417,7 @@ export function Composer(props) {
 
   return (
     <footer className="composer-wrap">
-      <div className="composer">
+      <div className="composer" ref={composerRef}>
         <AnimatePresence initial={false}>
           {paramsOpen && (
             <motion.div
@@ -426,7 +435,10 @@ export function Composer(props) {
                 total={total}
                 filter={filter}
                 setFilter={setFilter}
-                onPickModel={onPickModel}
+                onPickModel={(key) => {
+                  onPickModel(key)
+                  setParamsOpen(false)
+                }}
                 selectedKey={selectedKey}
                 size={size} setSize={setSize}
                 detail={detail} setDetail={setDetail}

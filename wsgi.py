@@ -1,7 +1,11 @@
 """Gunicorn entrypoint."""
 import os
 
-from app import app
+from app import _recover_orphaned_jobs, app
+
+# Gunicorn 直接导入 wsgi:app，不会执行 app.py 的 main()。
+# 因此必须在生产 worker 加载时恢复上次未完成的任务。
+_recover_orphaned_jobs()
 
 if __name__ == "__main__":
     # Local debugging only; production runs gunicorn directly via systemd.

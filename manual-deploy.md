@@ -91,7 +91,7 @@ python token_daemon.py --run &     # 或使用 systemd，见 §6
 ```bash
 cd frontend
 npm install
-npm run build         # 产物在 frontend/dist
+VITE_PAGES_BASE=/ npm run build   # 产物在 frontend/dist；Nginx 从根路径提供 SPA
 cd ..
 ```
 
@@ -140,6 +140,8 @@ Environment="FLASK_HOST=127.0.0.1"
 Environment="FLASK_PORT=19998"
 Environment="PORT=19998"
 Environment="CORS_ORIGINS=https://your-frontend.example,https://jameszhaoy.github.io"
+Environment="FLASK_PUBLIC=1"
+Environment="ADMIN_API_KEY=replace-with-a-long-random-secret"
 ExecStart=/opt/firefly-studio/.venv/bin/gunicorn \
     -w 1 -k gthread --threads 4 --timeout 600 \
     --bind 127.0.0.1:19998 \

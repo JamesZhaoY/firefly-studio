@@ -70,9 +70,73 @@ class Database:
                     CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
                     CREATE INDEX IF NOT EXISTS idx_logs_job ON api_logs(job_id);
                     CREATE INDEX IF NOT EXISTS idx_logs_created ON api_logs(created_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS accounts (
+                        id TEXT PRIMARY KEY,
+                        label TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_label ON accounts(label);
                     """
                 )
                 conn.commit()
+            finally:
+                conn.close()
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        with _lock:
+            conn = self._conn()
+            try:
+                rows = conn.execute(
+                    "SELECT id, label, payload_json, created_at, updated_at FROM accounts ORDER BY label COLLATE NOCASE"
+                ).fetchall()
+            finally:
+                conn.close()
+        out = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+                if isinstance(payload, dict):
+                    out.append(payload)
+            except Exception:
+                continue
+        return out
+
+    def save_account(self, account: dict[str, Any]) -> None:
+        now = time.time()
+        with _lock:
+            conn = self._conn()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO accounts (id, label, payload_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        label=excluded.label,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        account["id"],
+                        account["label"],
+                        json.dumps(account, ensure_ascii=False),
+                        float(account.get("added_at") or now),
+                        now,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_account(self, account_id: str) -> bool:
+        with _lock:
+            conn = self._conn()
+            try:
+                cur = conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+                conn.commit()
+                return cur.rowcount > 0
             finally:
                 conn.close()
 

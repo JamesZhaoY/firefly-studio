@@ -66,13 +66,13 @@ export function Suggestion({ prompt, onPick }) {
 }
 
 export const GhostButton = forwardRef(function GhostButton(
-  { children, danger, disabled, onClick, title, ariaLabel },
+  { children, danger, disabled, onClick, title, ariaLabel, type = "button" },
   ref,
 ) {
   return (
     <button
       ref={ref}
-      type="button"
+      type={type}
       className={`ghost-btn ${danger ? 'danger' : ''}`}
       onClick={onClick}
       disabled={disabled}

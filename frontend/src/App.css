@@ -1302,6 +1302,12 @@
   background: color-mix(in srgb, var(--err) 10%, transparent);
   color: var(--err);
 }
+.log-error {
+  margin: 8px 0 0 16px;
+  color: var(--err);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .log-details { margin-top: 8px; }
 .log-details summary {
   width: fit-content;
@@ -1339,6 +1345,196 @@
   text-align: center;
   color: var(--fg-3);
   font-size: 14px;
+}
+
+
+/* ── accounts pool ─────────────────────────────────────────── */
+
+.accounts-content {
+  padding: 24px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 980px;
+}
+
+.accounts-upload {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.accounts-upload-head {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+  letter-spacing: 0.02em;
+}
+.accounts-upload-row {
+  display: flex;
+  gap: 14px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+.accounts-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg-3);
+  flex: 1 1 180px;
+  min-width: 160px;
+}
+.accounts-field input[type="text"],
+.accounts-field input[type="file"] {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--fg);
+  font-size: 13px;
+}
+.accounts-field input[type="file"] {
+  padding: 6px;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.accounts-upload-hint {
+  font-size: 12px;
+  color: var(--fg-3);
+  line-height: 1.6;
+}
+.accounts-upload-hint code {
+  background: var(--bg-3);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.accounts-summary {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--fg-3);
+  flex-wrap: wrap;
+}
+.accounts-summary b {
+  color: var(--fg);
+  font-weight: 600;
+}
+.accounts-summary .warn b { color: var(--warn, #e0a800); }
+.accounts-summary .muted { opacity: 0.7; }
+
+.accounts-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.account-row {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 188px;
+}
+.account-row.tone-cooling { border-color: rgba(224, 168, 0, 0.4); }
+.account-row.tone-disabled { opacity: 0.6; }
+
+.account-row-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.account-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--fg-3);
+}
+.account-dot.tone-ok { background: #58c47e; box-shadow: 0 0 0 2px rgba(88, 196, 126, 0.15); }
+.account-dot.tone-cooling { background: #e0a800; }
+.account-dot.tone-disabled { background: #6b7280; }
+
+.account-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.account-edit {
+  background: transparent;
+  border: none;
+  color: var(--fg-3);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 4px;
+  opacity: 0.5;
+}
+.account-edit:hover { opacity: 1; color: var(--fg); }
+
+.account-state {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+}
+.account-state.tone-ok { color: #58c47e; border-color: rgba(88,196,126,0.4); }
+.account-state.tone-cooling { color: #e0a800; border-color: rgba(224,168,0,0.4); }
+.account-state.tone-disabled { color: #6b7280; }
+
+.account-rename {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.account-rename input {
+  background: var(--bg-1);
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  padding: 4px 8px;
+  color: var(--fg);
+  font-size: 13px;
+  width: 180px;
+}
+
+.account-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--fg-3);
+}
+.account-meta code {
+  background: var(--bg-3);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10.5px;
+}
+.account-err {
+  color: #e87c7c;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-credits { color: var(--fg-2); }
+.account-credits.err { color: #e87c7c; }
+
+.account-actions {
+  display: flex;
+  gap: 8px;
+}
+.ghost-btn.small {
+  padding: 4px 10px;
+  font-size: 11px;
 }
 
 

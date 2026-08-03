@@ -29,10 +29,13 @@ import base64
 import json
 import os
 import random
+import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -45,6 +48,13 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 OUT_DIR = APP_ROOT / "outputs"
 DEFAULT_STORAGE = DATA_DIR / "storage.json"
 DEFAULT_TOKEN_FILE = DATA_DIR / "current_token.json"
+
+from token_pool import Account, TokenPool, get_pool as _get_pool  # noqa: E402
+
+# Thread-local: 记住本线程最近 acquire 的账号, 供 release_token() 使用.
+# 旧调用方仍可调用 require_token() 不感知 pool; 成功/失败在 finally 里 release 即可.
+_TLS = threading.local()
+_POOL_REFRESH_LOCK = threading.Lock()
 
 DEFAULT_BASE = "https://firefly-3p.ff.adobe.io"
 DEFAULT_JOBS_HOST = "bks-epo8552.adobe.io"
@@ -158,14 +168,11 @@ def resolve_arp_session_id(preferred: str | None = None) -> str:
     return generate_arp_session_id()
 
 
-def _cookie_header_from_storage(storage_path: Path) -> str:
-    try:
-        storage = json.loads(storage_path.read_text(encoding="utf-8"))
-    except Exception:
-        return ""
+def cookie_header(cookies: list[dict[str, Any]]) -> str:
+    """把上传账号保存的 Playwright cookies 转为 IMS 请求 Cookie header."""
     seen: set[str] = set()
     parts: list[str] = []
-    for c in storage.get("cookies") or []:
+    for c in cookies:
         name = c.get("name")
         value = c.get("value")
         if not name or value is None or name in seen:
@@ -179,13 +186,10 @@ def ims_refresh_token(
     *,
     client_id: str = API_KEY_PROJECTX,
     origin: str = ORIGIN_EXPRESS,
-    storage_path: Path | None = None,
+    cookies: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any]] | None:
-    """用 storage cookie 调 IMS check/v6/token（adobe2api 同款）。"""
-    sp = storage_path or Path(env("FIREFLY_STORAGE", str(DEFAULT_STORAGE)))
-    if not sp.exists():
-        return None
-    cookie = _cookie_header_from_storage(sp)
+    """用已上传账号的 cookie 调 IMS check/v6/token。"""
+    cookie = cookie_header(cookies)
     if "ims_sid=" not in cookie and "aux_sid=" not in cookie:
         return None
     headers = {
@@ -208,7 +212,9 @@ def ims_refresh_token(
 
             with CurlSession(impersonate=env("FIREFLY_IMPERSONATE", DEFAULT_IMPERSONATE), timeout=30) as sess:
                 r = sess.post(IMS_CHECK_URL, headers=headers, data=form)
-        except ImportError:
+        except Exception as curl_error:
+            # curl_cffi 在某些 OpenSSL/macOS 组合无法初始化；cookie 仍可交给 requests 试一次。
+            print(f"[警告] IMS curl_cffi 失败，回退 requests: {curl_error}", file=sys.stderr)
             r = requests.post(IMS_CHECK_URL, headers=headers, data=form, timeout=30)
     except Exception as e:
         print(f"[警告] IMS 刷新网络失败: {e}", file=sys.stderr)
@@ -230,103 +236,116 @@ def ims_refresh_token(
 
 
 def require_token() -> tuple[str, dict]:
-    """返回 (token, extras)。
+    """返回 (token, extras). 仅从 pool 取账号; pool 空直接抛错.
 
-    绕过 408 实测结论 (2026-07):
-      - firefly daemon 的 token client_id=clio-playground-web
-      - 必须: x-api-key=clio-playground-web + origin=firefly.adobe.com
-             + x-arp-session-id=base64({sid,ftr})
-      - 缺 arp → 稳定 408；UUID arp 无效
-      - projectx_webapp token (IMS cookie 刷) + express origin: arp 可选
-      - generate 不要带 Cookie（带了反而 431）
+    调用方需在 finally 里调 release_token() 上报成功/失败, 供 pool 计算冷却.
+    账号必须通过 /api/accounts/upload 上传; 不再读 current_token.json / storage.json /
+    FIREFLY_TOKEN 等老路径.
     """
-    extras: dict[str, str] = {}
+    token, extras, _acct = acquire_token()
+    return token, extras
 
-    # 可选: 优先 IMS cookie 刷 projectx（与 adobe2api 一致，arp 可选）
-    if env("FIREFLY_IMS_REFRESH", "1") in ("1", "true", "yes"):
-        prefer = env("FIREFLY_IMS_CLIENT", API_KEY_CLIO)  # 默认跟 firefly 站
-        origin = (
-            ORIGIN_EXPRESS if prefer == API_KEY_PROJECTX else ORIGIN_FIREFLY
+
+def acquire_token() -> tuple[str, dict, Account]:
+    """从 pool 取一个健康账号.
+
+    返回 (token, extras, account). extras 已填好 _api_key / _arp_session_id / _org_id.
+    把 release_fn 存进 TLS, 调用方需调 release_token() 上报结果.
+    """
+    pool = _get_pool()
+    if not pool.list():
+        raise RuntimeError(
+            "账号池为空. 请到「账号池」页面上传 token_file (current_token.json) "
+            "+ cookie_file (storage.json, 可选)."
         )
-        refreshed = ims_refresh_token(client_id=prefer, origin=origin)
-        if refreshed:
-            tok, meta = refreshed
-            claims = decode_jwt_payload(tok)
-            print(
-                f"[信息] IMS cookie 刷新成功 client_id={claims.get('client_id')}"
-            )
-            extras["_api_key"] = str(claims.get("client_id") or prefer)
-            extras["_from_ims"] = "1"
-            # 写回 token 文件，供下次/其它进程使用
-            tf = Path(env("FIREFLY_TOKEN_FILE", str(DEFAULT_TOKEN_FILE)))
-            try:
-                exp_in = int(meta.get("expires_in") or 86000)
-                payload = {
-                    "token": tok,
-                    "expires_in": exp_in,
-                    "expires_at": time.time() + exp_in,
-                    "captured_at": time.time(),
-                    "client_id": claims.get("client_id"),
-                    "source": "ims_check_v6",
-                }
-                tf.parent.mkdir(parents=True, exist_ok=True)
-                tmp = tf.with_suffix(".tmp")
-                tmp.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    try:
+        acct, release_fn = pool.acquire(timeout=0.1)
+    except RuntimeError:
+        # 所有账号失效/冷却时，优先用各账号已上传的 cookie 恢复 token。
+        # 只在 pool 无可用账号时执行，避免每个生成请求都打 IMS。
+        with _POOL_REFRESH_LOCK:
+            for candidate in pool.list():
+                if not pool.should_auto_refresh(candidate):
+                    continue
+                prefer = candidate.client_id or API_KEY_CLIO
+                origin = ORIGIN_EXPRESS if prefer == API_KEY_PROJECTX else ORIGIN_FIREFLY
+                refreshed = ims_refresh_token(
+                    client_id=prefer,
+                    origin=origin,
+                    cookies=candidate.cookies,
                 )
-                tmp.replace(tf)
-            except Exception as e:
-                print(f"[警告] 写 token 文件失败: {e}", file=sys.stderr)
-            return tok, extras
+                if not refreshed:
+                    continue
+                token, meta = refreshed
+                claims = decode_jwt_payload(token)
+                pool.set_token(
+                    candidate.id,
+                    token=token,
+                    expires_at=time.time() + int(meta.get("expires_in") or 86000),
+                    client_id=str(claims.get("client_id") or prefer),
+                )
+                pool.mark_refreshed(candidate.id)
+        acct, release_fn = pool.acquire(timeout=30.0)
+    extras: dict[str, str] = {
+        "_api_key": acct.api_key or acct.client_id,
+        "_arp_session_id": acct.arp_session_id,
+        "_org_id": acct.org_id,
+        "_account_id": acct.id,
+        "_account_label": acct.label,
+    }
+    _TLS.account_id = acct.id
+    _TLS.account_label = acct.label
+    _TLS.release_fn = release_fn
+    return acct.token, extras, acct
 
-    t = env("FIREFLY_TOKEN")
-    if t:
-        return t, extras
 
-    candidates = [
-        Path(env("FIREFLY_TOKEN_FILE", str(DEFAULT_TOKEN_FILE))),
-        Path(env("FIREFLY_OAUTH_TOKEN_FILE", str(DATA_DIR / "oauth_token.json"))),
-    ]
-    for tf in candidates:
-        if not tf.exists():
-            continue
+def release_token(ok: bool, error: str = "") -> bool:
+    """上报当前线程最近一次 acquire 的结果. 没 acquire 过或 legacy 模式 → False (no-op)."""
+    release_fn = getattr(_TLS, "release_fn", None)
+    if release_fn is None:
+        _TLS.account_id = None
+        _TLS.account_label = None
+        return False
+    try:
+        release_fn(ok, error)
+    finally:
+        _TLS.release_fn = None
+        _TLS.account_id = None
+        _TLS.account_label = None
+    return True
+
+
+def _release_firefly_call(func):
+    """让每一次 Firefly 生成调用独立归还账号租约。
+
+    一键成片会连续调用多个分镜；如果由外层整条任务统一 release，前面
+    分镜获取的账号会永远保持 in_use。这个装饰器覆盖成功、异常和下载失败。
+    """
+    @wraps(func)
+    def wrapped(*args, **kwargs):
         try:
-            data = json.loads(tf.read_text(encoding="utf-8"))
-            tok = data.get("token") or data.get("access_token") or data.get("value")
-            exp = data.get("expires_at", 0)
-            if not tok:
-                continue
-            if exp and time.time() > exp:
-                print(
-                    f"[警告] {tf.name} 已过期 ({datetime.fromtimestamp(exp).isoformat()})",
-                    file=sys.stderr,
-                )
-                continue
-            print(f"[信息] 从 {tf.name} 读取 token")
-            claims = decode_jwt_payload(str(tok))
-            cid = str(
-                data.get("client_id") or claims.get("client_id") or ""
-            ).strip()
-            if cid:
-                extras["_api_key"] = cid
-            org = data.get("org_id")
-            if org and not env("FIREFLY_ORG_ID"):
-                extras["_org_id"] = org
-            arp = data.get("arp_session_id") or (
-                (data.get("headers") or {}).get("x-arp-session-id")
-                if isinstance(data.get("headers"), dict)
-                else None
-            )
-            if _is_valid_arp(arp):
-                extras["_arp_session_id"] = str(arp).strip()
-            return str(tok), extras
-        except Exception as e:
-            print(f"[警告] 读 {tf} 失败: {e}", file=sys.stderr)
+            result = func(*args, **kwargs)
+        except Exception as exc:
+            release_token(ok=False, error=str(exc))
+            raise
+        else:
+            release_token(ok=True)
+            return result
 
-    raise RuntimeError(
-        "未设置 FIREFLY_TOKEN, 且未找到可用的 token 文件。"
-        "先跑 python token_daemon.py --start, 或保证 data/storage.json 有 ims_sid。"
-    )
+    return wrapped
+
+
+def current_account_label() -> str:
+    """诊断用: 当前线程最近 acquire 的账号 label. 没有则 ''."""
+    return str(getattr(_TLS, "account_label", "") or "")
+
+
+def current_account_id() -> str:
+    return str(getattr(_TLS, "account_id", "") or "")
+
+
+def pool_status() -> dict[str, Any]:
+    return _get_pool().status()
 
 
 def require_token_simple() -> str:
@@ -373,14 +392,100 @@ _USER_ERROR_RULES: list[tuple[str, str]] = [
     ("rate", "上游限流,请稍后重试。"),
     ("quota", "上游额度已用完,请稍后再试。"),
     ("credit", "账户余额不足,请先充值。"),
-    ("expired", "登录状态已过期,请重新运行 token_daemon.py --start。"),
-    ("鉴权", "登录状态已过期,请重新运行 token_daemon.py --start。"),
-    ("auth", "登录状态已过期,请重新运行 token_daemon.py --start。"),
-    ("unauthorized", "登录状态已过期,请重新运行 token_daemon.py --start。"),
+    ("expired", "账号 token 已过期,请在「账号池」页面上传新 token 刷新。"),
+    ("鉴权", "账号 token 已过期,请在「账号池」页面上传新 token 刷新。"),
+    ("auth", "账号 token 已过期,请在「账号池」页面上传新 token 刷新。"),
+    ("unauthorized", "账号 token 已过期,请在「账号池」页面上传新 token 刷新。"),
     ("timeout", "请求超时,可重试或调高 max_wait。"),
     ("network", "网络异常,请检查本地代理或重试。"),
     ("not found", "该模型在当前账号下不可用,请更换模型。"),
 ]
+
+_SENSITIVE_ERROR_VALUE = re.compile(
+    r"(?i)(authorization|token|cookie|secret|password|api[_-]?key)\s*([:=])\s*([^\s,;]+)"
+)
+
+
+def _safe_error_text(value: Any, *, limit: int = 280) -> str:
+    """将上游错误压缩为可展示文本，避免把凭据带到任务和日志页面。"""
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            text = str(value)
+    else:
+        text = str(value)
+    text = " ".join(text.replace("\n", " ").split())
+    text = _SENSITIVE_ERROR_VALUE.sub(r"\1\2[已隐藏]", text)
+    return text[:limit]
+
+
+def _upstream_error_fields(payload: Any) -> dict[str, Any]:
+    """提取 Adobe 错误响应中少量可安全展示的诊断字段。"""
+    if not isinstance(payload, dict):
+        detail = _safe_error_text(payload)
+        return {"detail": detail} if detail else {}
+
+    out: dict[str, Any] = {}
+    for key in ("code", "error_code", "status", "state", "type"):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float, bool)) and str(value).strip():
+            out[key] = value
+
+    for key in ("message", "detail", "reason", "title", "description", "msg"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            out["detail"] = _safe_error_text(value)
+            break
+        if isinstance(value, dict):
+            nested = _upstream_error_fields(value)
+            if nested.get("detail"):
+                out["detail"] = nested["detail"]
+                break
+
+    error = payload.get("error")
+    if "detail" not in out and isinstance(error, str) and error.strip():
+        out["detail"] = _safe_error_text(error)
+    elif "detail" not in out and isinstance(error, dict):
+        nested = _upstream_error_fields(error)
+        if nested.get("detail"):
+            out["detail"] = nested["detail"]
+    return out
+
+
+class UpstreamResponseError(RuntimeError):
+    """上游 HTTP 错误，保留经过脱敏的响应摘要供界面和日志诊断。"""
+
+    def __init__(self, status_code: int, stage: str, payload: Any) -> None:
+        self.status_code = int(status_code)
+        self.stage = stage
+        self.payload = _upstream_error_fields(payload)
+        detail = self.payload.get("detail") or "上游未提供额外说明"
+        super().__init__(f"HTTP {self.status_code} {stage}: {detail}")
+
+
+class UpstreamTaskFailed(RuntimeError):
+    """上游已受理但任务终态失败；保留状态体供任务层决定是否可安全重投。"""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))[:2000]
+        super().__init__(f"upstream task terminal failure: {raw}")
+
+
+def upstream_error_details(error: Any) -> dict[str, Any]:
+    """返回可写入数据库、可在日志页查看的安全诊断信息。"""
+    if isinstance(error, UpstreamResponseError):
+        return {
+            "http_status": error.status_code,
+            "stage": error.stage,
+            **error.payload,
+        }
+    if isinstance(error, UpstreamTaskFailed):
+        return _upstream_error_fields(error.payload)
+    return {}
 
 
 def summarize_upstream_error(payload: Any) -> str:
@@ -390,7 +495,10 @@ def summarize_upstream_error(payload: Any) -> str:
     通过 task_failed / task_traceback 日志保留,运维可在日志页查看。
     """
     blob = ""
-    if isinstance(payload, dict):
+    details = upstream_error_details(payload)
+    if details:
+        blob = _safe_error_text(details)
+    elif isinstance(payload, dict):
         for key in ("message", "error", "exception", "reason", "msg"):
             v = payload.get(key)
             if isinstance(v, str) and v.strip():
@@ -408,13 +516,38 @@ def summarize_upstream_error(payload: Any) -> str:
         if needle in lower:
             return message
 
+    if any(marker in lower for marker in ("taste_exhausted", "quota", "credit", "exhaust")):
+        return "上游额度已用完，请更换有额度的账号或稍后再试。"
+    if "forbidden" in lower:
+        return "视频请求被 Adobe 拒绝，请检查模型权限或 Firefly 登录会话。"
     if any(s in blob for s in ("401", "403")) or "登录" in blob:
-        return "登录状态已过期,请重新运行 token_daemon.py --start。"
+        return "账号 token 已过期,请在「账号池」页面上传新 token 刷新。"
     if "408" in blob or "超时" in blob:
         return "请求超时,请稍后重试。"
+    if "422" in blob:
+        detail = _safe_error_text(details.get("detail") if details else "")
+        if detail and "上游未提供额外说明" not in detail:
+            return f"上游任务返回 HTTP 422：{detail}"
+        return "上游任务返回 HTTP 422，当前模型、参数或提示词可能不被接受；请切换模型或调整提示词后重试。"
+    if any(marker in lower for marker in ("sslerror", "tls connect", "openssl", "invalid library")):
+        return "本地 TLS 连接异常，请重启服务；若持续出现，请修复 curl_cffi/OpenSSL 环境。"
     if any(s in blob for s in ("500", "502", "503", "504")):
         return "上游服务暂时不可用,请稍后重试。"
     return "生成失败,请稍后重试或在日志页查看详情。"
+
+
+def is_retryable_upstream_error(error: Any) -> bool:
+    """仅对账号/上游暂态错误换号重试；审核、版权、安全策略不重试。"""
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "401", "403", "408", "429", "500", "502", "503", "504",
+            "unauthorized", "forbidden", "expired", "鉴权",
+            "quota", "credit", "exhaust", "taste_exhausted", "rate", "limit", "throttle",
+            "timeout", "timed out", "network", "connection",
+        )
+    )
 
 
 def new_seed() -> int:
@@ -542,7 +675,12 @@ class FireflyClient:
                 r = self.session_http.post(
                     url, headers=self._headers(), json=body, timeout=timeout
                 )
-            except (requests.ConnectionError, requests.Timeout) as e:
+            except Exception as e:
+                transient = isinstance(e, (requests.ConnectionError, requests.Timeout)) or type(e).__name__ in {
+                    "ConnectionError", "Timeout", "SSLError",
+                }
+                if not transient:
+                    raise
                 last_err = e
                 if attempt < max_retries:
                     delay = base_delay * (2**attempt)
@@ -552,7 +690,7 @@ class FireflyClient:
                     )
                     time.sleep(delay)
                     continue
-                raise RuntimeError(summarize_upstream_error({"message": "网络失败"})) from e
+                raise RuntimeError(summarize_upstream_error(str(e))) from e
 
             if r.status_code < 400:
                 return r
@@ -561,10 +699,19 @@ class FireflyClient:
             if r.status_code in (401, 403):
                 access_err = r.headers.get("x-access-error") or ""
                 if access_err == "taste_exhausted":
-                    raise RuntimeError(summarize_upstream_error({"message": "quota exhausted"}))
+                    raise RuntimeError(
+                        f"HTTP {r.status_code} taste_exhausted: "
+                        f"{summarize_upstream_error({'message': 'quota exhausted'})}"
+                    )
                 if label == "视频提交":
-                    raise RuntimeError("视频请求被 Adobe 拒绝（403）；请检查视频模型权限和 Firefly 登录会话。")
-                raise RuntimeError(summarize_upstream_error({"message": f"{label} 鉴权失败"}))
+                    raise RuntimeError(
+                        f"HTTP {r.status_code} forbidden: "
+                        "视频请求被 Adobe 拒绝；请检查视频模型权限和 Firefly 登录会话。"
+                    )
+                raise RuntimeError(
+                    f"HTTP {r.status_code} auth: "
+                    f"{summarize_upstream_error({'message': f'{label} 鉴权失败'})}"
+                )
 
             is_408 = r.status_code == 408
             is_soft = r.status_code in soft_retryable
@@ -595,12 +742,15 @@ class FireflyClient:
 
             if is_408:
                 raise RuntimeError(
-                    summarize_upstream_error({"message": "持续 408"})
+                    "HTTP 408 timeout: "
+                    + summarize_upstream_error({"message": "持续 408"})
                 )
 
-            raise RuntimeError(
-                summarize_upstream_error({"message": f"{label} HTTP {r.status_code}"})
-            )
+            try:
+                error_payload: Any = r.json()
+            except Exception:
+                error_payload = r.text[:1000]
+            raise UpstreamResponseError(r.status_code, label, error_payload)
 
         raise RuntimeError(summarize_upstream_error({"message": "重试多次后仍失败"}))
 
@@ -839,10 +989,12 @@ class FireflyClient:
             r = self.session_http.get(
                 url, headers=self._headers(), params=params, timeout=timeout
             )
-            if r.status_code in (401, 403):
-                raise RuntimeError(summarize_upstream_error({"message": "查询鉴权失败"}))
             if r.status_code >= 400:
-                raise RuntimeError(summarize_upstream_error({"message": f"查询失败 HTTP {r.status_code}"}))
+                try:
+                    error_payload: Any = r.json()
+                except Exception:
+                    error_payload = r.text[:1000]
+                raise UpstreamResponseError(r.status_code, "query", error_payload)
             try:
                 data = r.json()
             except ValueError:
@@ -870,8 +1022,7 @@ class FireflyClient:
                     continue
                 return data
             if self._is_failed(status):
-                user_msg = summarize_upstream_error(data) or "生成失败"
-                raise RuntimeError(user_msg)
+                raise UpstreamTaskFailed(data)
             time.sleep(interval)
 
     # Adobe / Firefly status_code 数值约定:
@@ -1012,6 +1163,7 @@ def _make_client() -> FireflyClient:
     return client
 
 
+@_release_firefly_call
 def generate_image(
     prompt: str,
     *,
@@ -1109,6 +1261,8 @@ def generate_image(
         "poll_url": poll_url,
         "result": result,
         "outputs": outputs,
+        "account_id": current_account_id(),
+        "account_label": current_account_label(),
         "submit_status_code": int(
             getattr(getattr(client, "_last_submit_response", None), "status_code", 200)
         )
@@ -1154,6 +1308,7 @@ def run_image(
     return paths
 
 
+@_release_firefly_call
 def generate_video(
     prompt: str,
     *,
@@ -1253,6 +1408,8 @@ def generate_video(
         "poll_url": poll_url,
         "result": result,
         "outputs": outputs,
+        "account_id": current_account_id(),
+        "account_label": current_account_label(),
         "submit_status_code": int(getattr(last, "status_code", 200)) if last else 200,
     }
 

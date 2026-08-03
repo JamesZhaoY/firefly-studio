@@ -18,6 +18,10 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:7860',
         changeOrigin: true,
+      },
+      '/outputs': {
+        target: 'http://127.0.0.1:7860',
+        changeOrigin: true,
       }
     },
   },

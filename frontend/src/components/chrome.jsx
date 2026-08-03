@@ -28,6 +28,16 @@ function NavIcon({ id }) {
           <path d="M11 11a2 2 0 1 0 4 0 2 2 0 0 0-4 0z" opacity=".4" />
         </svg>
       )
+    case 'accounts':
+      return (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="9" cy="8" r="3" />
+          <path d="M3 20a6 6 0 0 1 12 0" />
+          <circle cx="17" cy="9" r="2.5" />
+          <path d="M14 20a5 5 0 0 1 7-4.5" />
+        </svg>
+      )
     case 'logs':
     default:
       return (
@@ -79,23 +89,18 @@ export function RecentItem({ job, onSelect }) {
   )
 }
 
-export function AuthBadge({ auth, credits, modelInfo, onRefresh }) {
+export function AuthBadge({ auth, modelInfo, onRefresh }) {
   const cls = !auth
     ? 'err'
     : auth.token_ok || auth.can_ims_refresh ? 'ok' : 'err'
+  const poolMode = auth?.mode === 'pool'
   const text = !auth
     ? '离线'
-    : auth.token_ok || auth.can_ims_refresh
-      ? auth.client_id || '已就绪'
-      : '未登录'
-  const quota = credits?.available != null
-    ? `${credits.available} / ${credits.total ?? '?'} 积分`
-    : credits?.error ? '额度暂不可读取' : ''
-  const resetAt = credits?.available_until
-    ? new Date(credits.available_until).toLocaleString('zh-CN', {
-      month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
-    })
-    : ''
+    : poolMode
+      ? `账号池 ${auth.pool?.available ?? 0}/${auth.pool?.size ?? 0}`
+      : auth.token_ok || auth.can_ims_refresh
+        ? auth.client_id || '已就绪'
+        : '未登录'
 
   return (
     <div className="sidebar-foot">
@@ -103,8 +108,6 @@ export function AuthBadge({ auth, credits, modelInfo, onRefresh }) {
         <span className="dot" />
         <div className="auth-text">
           <span className="auth-label">{text}</span>
-          {quota && <span className="auth-time" title={credits?.error || ''}>{quota}</span>}
-          {resetAt && <span className="auth-time">重置 {resetAt}</span>}
         </div>
       </div>
       {modelInfo && <span className="model-info">{modelInfo}</span>}
@@ -115,13 +118,19 @@ export function AuthBadge({ auth, credits, modelInfo, onRefresh }) {
   )
 }
 
-export function Sidebar({ page, setPage, jobs, logs, auth, credits, modelInfo, onRefreshModels, onSelectJob }) {
+export function Sidebar({ page, setPage, jobs, logs, accounts, auth, modelInfo, onRefreshModels, onSelectJob }) {
+  const accountHint = !accounts
+    ? ''
+    : accounts.length
+      ? `${accounts.filter((a) => a.healthy && !a.disabled).length}/${accounts.length}`
+      : ''
   return (
     <aside className="sidebar">
       <Brand />
       <nav className="nav" aria-label="主导航">
         <NavItem page={page} id="chat" setPage={setPage} label="对话" hint="Cmd K" />
         <NavItem page={page} id="explore" setPage={setPage} label="探索" hint="Cmd E" />
+        <NavItem page={page} id="accounts" setPage={setPage} label="账号池" hint={accountHint} />
         <NavItem
           page={page}
           id="logs"
@@ -136,7 +145,7 @@ export function Sidebar({ page, setPage, jobs, logs, auth, credits, modelInfo, o
         {!jobs.length && <div className="recent-empty">还没有任务</div>}
       </div>
 
-      <AuthBadge auth={auth} credits={credits} modelInfo={modelInfo} onRefresh={onRefreshModels} />
+      <AuthBadge auth={auth} modelInfo={modelInfo} onRefresh={onRefreshModels} />
     </aside>
   )
 }

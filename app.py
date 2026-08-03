@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 import os
+import hmac
+import queue
+import shutil
 import threading
 import time
 import sys
@@ -15,6 +18,7 @@ import traceback
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -29,22 +33,57 @@ from models_catalog import (
     flatten_discovery_models,
     split_by_kind,
 )
+from token_pool import get_pool
 
 APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = APP_ROOT / "data"
 OUT_DIR = APP_ROOT / "outputs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "firefly.db"
+if os.environ.get("FIREFLY_DB_PATH"):
+    DB_PATH = Path(os.environ["FIREFLY_DB_PATH"]).expanduser()
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
 _cors_origins = os.environ.get("CORS_ORIGINS", "*")
+_admin_api_key = (os.environ.get("ADMIN_API_KEY") or "").strip()
+_public_mode = os.environ.get("FLASK_PUBLIC") == "1"
 CORS(app, resources={r"/api/*": {"origins": _cors_origins.split(",") if _cors_origins != "*" else "*"}})
 
 db = Database(DB_PATH)
-_executor_sema = threading.Semaphore(2)
+_job_queue: queue.Queue[tuple[str, str]] = queue.Queue(
+    maxsize=max(1, int(os.environ.get("JOB_QUEUE_SIZE", "24")))
+)
+_job_workers_started = False
+_job_workers_lock = threading.Lock()
+_job_worker_count = max(1, int(os.environ.get("JOB_WORKERS", "2")))
+_executor_sema = threading.Semaphore(_job_worker_count)
 _models_cache: dict[str, Any] = {"ts": 0.0, "data": None, "error": ""}
 _credits_cache: dict[str, Any] = {"ts": 0.0, "data": {}}
+_account_credits_cache: dict[str, dict[str, Any]] = {}
+_credits_refresh_lock = threading.Lock()
+_credits_refresh_running = False
+
+
+@app.before_request
+def _require_api_key():
+    """可选的 API 保护；公网模式下未配置 key 时默认拒绝 API 请求。"""
+    if not request.path.startswith("/api/"):
+        return None
+    if request.method == "OPTIONS":
+        return None
+    if not _admin_api_key:
+        if _public_mode:
+            return jsonify({"error": "公网模式必须配置 ADMIN_API_KEY"}), 503
+        return None
+    supplied = request.headers.get("X-Admin-Key", "")
+    if not supplied:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+    if not supplied or not hmac.compare_digest(supplied, _admin_api_key):
+        return jsonify({"error": "需要有效的 ADMIN_API_KEY"}), 401
+    return None
 
 # ── models cache ─────────────────────────────────────────────
 
@@ -103,13 +142,18 @@ def _fetch_live_models() -> list[dict[str, Any]]:
         api_key=extras.get("_api_key"),
         org_id=extras.get("_org_id"),
     )
-    families = client.list_models()
-    flat = flatten_discovery_models(families)
     try:
-        _save_flat_to_disk(flat, families)
-    except Exception:
-        pass
-    return flat
+        families = client.list_models()
+        flat = flatten_discovery_models(families)
+        try:
+            _save_flat_to_disk(flat, families)
+        except Exception:
+            pass
+        fp.release_token(ok=True)
+        return flat
+    except Exception as e:
+        fp.release_token(ok=False, error=str(e))
+        raise
 
 def _get_models_by_kind(*, force_live: bool = False) -> tuple[dict[str, list], str, str]:
     now = time.time()
@@ -151,42 +195,55 @@ def _get_models_by_kind(*, force_live: bool = False) -> tuple[dict[str, list], s
     return by_kind, source, err
 
 def _auth_status() -> dict[str, Any]:
-    """登录态摘要（公网可读）。不返回绝对路径、token client_id、expires 详情。"""
-    storage = Path(fp.env("FIREFLY_STORAGE", str(fp.DEFAULT_STORAGE)))
-    token_file = Path(fp.env("FIREFLY_TOKEN_FILE", str(fp.DEFAULT_TOKEN_FILE)))
-    info: dict[str, Any] = {
-        "token_ok": False,
-        "can_ims_refresh": storage.exists(),
+    """登录态摘要（公网可读）。完全从 pool 读; 不再回退到 current_token.json / storage.json."""
+    pool = get_pool()
+    accounts = pool.list()
+    return {
+        "token_ok": any(a.is_available() for a in accounts),
+        "can_ims_refresh": any(a.cookies for a in accounts),
+        "pool": pool.status(),
+        "mode": "pool",
+        "pool_empty": not accounts,
+        "hint": (
+            "请在「账号池」页面上传 token_file (必填) + cookie_file (可选)."
+            if not accounts
+            else ""
+        ),
     }
-    if token_file.exists():
-        try:
-            import json
-
-            data = json.loads(token_file.read_text(encoding="utf-8"))
-            tok = data.get("token")
-            exp = data.get("expires_at")
-            if exp:
-                info["token_ok"] = bool(tok) and time.time() < float(exp)
-            else:
-                info["token_ok"] = bool(tok)
-        except Exception:
-            pass
-    return info
 
 
 def _credits_status() -> dict[str, Any]:
+    """读一次额度. 元数据读, 不影响 pool 健康 (失败不 cooldown 账号).
+
+    只有「上游明确 401/403」才视为账号鉴权失败, 给该账号 cooldown.
+    token 缺字段 / 网络错 / 上游 5xx 都归为元数据问题, 不动 pool.
+    """
     now = time.time()
     cached = _credits_cache.get("data") or {}
     if now - float(_credits_cache.get("ts") or 0) < 30:
         return cached
+    label = ""
     try:
-        token, _ = fp.require_token()
+        token, extras = fp.require_token()
+        label = extras.get("_account_label", "")
         claims = fp.decode_jwt_payload(token)
-        account_id = str(
-            claims.get("user_id") or claims.get("aa_id") or claims.get("sub") or ""
+        account_id = (
+            str(claims.get("user_id") or "")
+            or str(claims.get("aa_id") or "")
+            or str(claims.get("sub") or "")
         ).strip()
         if not account_id:
-            raise RuntimeError("token 未包含账户 ID")
+            # token 解析不出账号 ID — 这是 token 格式问题, 不是账号失效.
+            # 释放但不 cooldown, 让账号继续可用于生成.
+            fp.release_token(ok=True)
+            data = {
+                "error": "当前账号 token 缺 user_id / aa_id / sub, 跳过额度读取",
+                "account_label": label,
+                "updated_at": now,
+            }
+            _credits_cache.update(ts=now, data=data)
+            return data
+
         response = requests.get(
             "https://firefly.adobe.io/v1/credits/balance",
             headers={
@@ -199,22 +256,115 @@ def _credits_status() -> dict[str, Any]:
             },
             timeout=20,
         )
-        if response.status_code != 200:
-            raise RuntimeError(f"Adobe 返回 HTTP {response.status_code}")
-        payload = response.json()
-        total_info = payload.get("total") if isinstance(payload, dict) else {}
-        quota = total_info.get("quota") if isinstance(total_info, dict) else {}
-        data = {
-            "total": quota.get("total"),
-            "used": quota.get("used"),
-            "available": quota.get("available"),
-            "available_until": total_info.get("availableUntil"),
-            "updated_at": now,
-            "error": "",
-        }
+        if response.status_code == 200:
+            fp.release_token(ok=True)
+            payload = response.json()
+            total_info = payload.get("total") if isinstance(payload, dict) else {}
+            quota = total_info.get("quota") if isinstance(total_info, dict) else {}
+            data = {
+                "total": quota.get("total"),
+                "used": quota.get("used"),
+                "available": quota.get("available"),
+                "available_until": total_info.get("availableUntil"),
+                "account_id": extras.get("_account_id", ""),
+                "account_label": label,
+                "updated_at": now,
+                "error": "",
+            }
+            _credits_cache.update(ts=now, data=data)
+            return data
+
+        # 非 200: 只在明确鉴权失败时 cooldown, 其它当元数据问题放过.
+        if response.status_code in (401, 403):
+            fp.release_token(ok=False, error=f"credits HTTP {response.status_code}")
+            err = f"账号鉴权失败 (HTTP {response.status_code}), 已切换下一个账号"
+        else:
+            fp.release_token(ok=True)
+            err = f"额度暂不可读取 (HTTP {response.status_code})"
+        data = {"error": err, "account_label": label, "updated_at": now}
+        _credits_cache.update(ts=now, data=data)
+        return data
     except Exception as e:
-        data = {"error": str(e), "updated_at": now}
-    _credits_cache.update(ts=now, data=data)
+        # 网络错 / JSON 错 / 任何意外 — 都是元数据问题, 不动 pool.
+        fp.release_token(ok=True)
+        data = {"error": f"额度暂不可读取: {e}", "account_label": label, "updated_at": now}
+        _credits_cache.update(ts=now, data=data)
+        return data
+
+
+def _refresh_credits_async() -> None:
+    """后台刷新额度，避免健康检查被 Adobe 网络请求阻塞。"""
+    global _credits_refresh_running
+    with _credits_refresh_lock:
+        if _credits_refresh_running:
+            return
+        _credits_refresh_running = True
+
+    def run() -> None:
+        global _credits_refresh_running
+        try:
+            _credits_status()
+        finally:
+            with _credits_refresh_lock:
+                _credits_refresh_running = False
+
+    threading.Thread(target=run, name="credits-refresh", daemon=True).start()
+
+
+def _credits_snapshot() -> dict[str, Any]:
+    now = time.time()
+    data = _credits_cache.get("data") or {}
+    if now - float(_credits_cache.get("ts") or 0) >= 30:
+        _refresh_credits_async()
+    return data or {"status": "refreshing", "updated_at": 0}
+
+
+def _account_credits_status(account) -> dict[str, Any]:
+    """读取指定账号额度；仅给账号池管理页展示，不改变 pool 健康状态。"""
+    now = time.time()
+    cached = _account_credits_cache.get(account.id)
+    if cached and now - float(cached.get("ts") or 0) < 30:
+        return cached["data"]
+
+    claims = fp.decode_jwt_payload(account.token)
+    account_id = (
+        str(claims.get("user_id") or "")
+        or str(claims.get("aa_id") or "")
+        or str(claims.get("sub") or "")
+    ).strip()
+    if not account_id:
+        data = {"error": "token 缺账户 ID，无法读取额度", "updated_at": now}
+    else:
+        try:
+            response = requests.get(
+                "https://firefly.adobe.io/v1/credits/balance",
+                headers={
+                    "Authorization": f"Bearer {account.token}",
+                    "x-api-key": "SunbreakWebUI1",
+                    "x-account-id": account_id,
+                    "Origin": "https://new.express.adobe.com",
+                    "Referer": "https://new.express.adobe.com/",
+                    "Accept": "application/json",
+                },
+                timeout=10,
+            )
+            if response.status_code != 200:
+                data = {"error": f"额度暂不可读取 (HTTP {response.status_code})", "updated_at": now}
+            else:
+                payload = response.json()
+                total_info = payload.get("total") if isinstance(payload, dict) else {}
+                quota = total_info.get("quota") if isinstance(total_info, dict) else {}
+                data = {
+                    "total": quota.get("total"),
+                    "used": quota.get("used"),
+                    "available": quota.get("available"),
+                    "available_until": total_info.get("availableUntil"),
+                    "updated_at": now,
+                    "error": "",
+                }
+        except Exception as e:
+            data = {"error": f"额度暂不可读取: {e}", "updated_at": now}
+    _account_credits_cache[account.id] = {"ts": now, "data": data}
     return data
 
 def _public_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -284,6 +434,45 @@ def _recover_orphaned_jobs() -> int:
 
 # ── job runner ───────────────────────────────────────────────
 
+def _job_worker_loop() -> None:
+    while True:
+        job_id, kind = _job_queue.get()
+        try:
+            if kind == "video_pipeline":
+                _run_video_job(job_id)
+            else:
+                _run_job(job_id)
+        except Exception:
+            # 运行函数内部会更新任务状态；这里避免 worker 线程退出。
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            _job_queue.task_done()
+
+
+def _ensure_job_workers() -> None:
+    global _job_workers_started
+    if _job_workers_started:
+        return
+    with _job_workers_lock:
+        if _job_workers_started:
+            return
+        for index in range(_job_worker_count):
+            threading.Thread(
+                target=_job_worker_loop,
+                name=f"firefly-job-{index + 1}",
+                daemon=True,
+            ).start()
+        _job_workers_started = True
+
+
+def _enqueue_job(job_id: str, kind: str) -> bool:
+    _ensure_job_workers()
+    try:
+        _job_queue.put_nowait((job_id, kind))
+        return True
+    except queue.Full:
+        return False
+
 def _run_job(job_id: str) -> None:
     with _executor_sema:
         job = db.get_job(job_id) or {}
@@ -333,6 +522,8 @@ def _run_job(job_id: str) -> None:
                     response_body={
                         "task_id": task_id,
                         "poll_url": poll_url,
+                        "account_id": fp.current_account_id(),
+                        "account_label": fp.current_account_label(),
                         "upstream": body,
                     },
                     duration_ms=(time.time() - submit_started) * 1000,
@@ -344,24 +535,25 @@ def _run_job(job_id: str) -> None:
                     progress=10,
                 )
 
-            if kind == "image":
-                size = str(params.get("size") or "auto")
-                detail = int(params.get("detail_level") or 3)
-                db.update_job(job_id, message="生成图片中…", progress=15)
-                data = fp.generate_image(
-                    prompt,
-                    model=model,
-                    model_version=version,
-                    n=n,
-                    size=size,
-                    seeds=seeds,
-                    detail_level=detail,
-                    poll_interval=float(params.get("poll_interval") or 4),
-                    max_wait=float(params.get("max_wait") or 900),
-                    download_dir=None,
-                    on_submitted=on_submitted,
-                )
-            else:
+            def run_upstream() -> dict[str, Any]:
+                if kind == "image":
+                    size = str(params.get("size") or "auto")
+                    detail = int(params.get("detail_level") or 3)
+                    db.update_job(job_id, message="生成图片中…", progress=15)
+                    return fp.generate_image(
+                        prompt,
+                        model=model,
+                        model_version=version,
+                        n=n,
+                        size=size,
+                        seeds=seeds,
+                        detail_level=detail,
+                        poll_interval=float(params.get("poll_interval") or 4),
+                        max_wait=float(params.get("max_wait") or 900),
+                        download_dir=None,
+                        on_submitted=on_submitted,
+                    )
+
                 duration = params.get("duration")
                 duration_i = int(duration) if duration not in (None, "", 0) else None
                 aspect = str(params.get("aspect_ratio") or "16:9").strip() or "16:9"
@@ -371,10 +563,8 @@ def _run_job(job_id: str) -> None:
                         fp.VIDEO_SIZE_BY_ASPECT.get(aspect)
                         or fp.VIDEO_SIZE_BY_ASPECT["16:9"]
                     )
-                audio = bool(params.get("generate_audio", True))
-                neg = str(params.get("negative_prompt") or "").strip()
                 db.update_job(job_id, message="生成视频中…", progress=15)
-                data = fp.generate_video(
+                return fp.generate_video(
                     prompt,
                     model=model,
                     model_version=version,
@@ -383,13 +573,46 @@ def _run_job(job_id: str) -> None:
                     duration=duration_i,
                     size=size,
                     aspect_ratio=aspect,
-                    generate_audio=audio,
-                    negative_prompt=neg,
+                    generate_audio=bool(params.get("generate_audio", True)),
+                    negative_prompt=str(params.get("negative_prompt") or "").strip(),
                     poll_interval=float(params.get("poll_interval") or 6),
                     max_wait=float(params.get("max_wait") or 1800),
                     download_dir=None,
                     on_submitted=on_submitted,
                 )
+
+            try:
+                data = run_upstream()
+            except Exception as first_error:
+                retryable = fp.is_retryable_upstream_error(first_error)
+                terminal_failure = isinstance(first_error, fp.UpstreamTaskFailed)
+                # 已受理任务一般只轮询，避免重复生成；但上游明确给出额度/鉴权/
+                # 限流等可重试终态时，换号重投一次。
+                if not retryable or (submitted["ok"] and not terminal_failure):
+                    raise
+                # 第一次临时失败: 当前账号入冷却并释放，下一次 run_upstream 会重新取号。
+                fp.release_token(ok=False, error=str(first_error))
+                db.add_log(
+                    job_id=job_id,
+                    phase="task_retry",
+                    method="INTERNAL",
+                    url=f"generate/{kind}",
+                    status_code=0,
+                    response_body={
+                        "attempt": 1,
+                        "reason": type(first_error).__name__,
+                        "message": str(first_error)[:240],
+                        "terminal_failure": terminal_failure,
+                    },
+                    duration_ms=(time.time() - t0) * 1000,
+                )
+                db.update_job(
+                    job_id,
+                    status="running",
+                    message="上游失败，切换账号后自动重试…",
+                    progress=15,
+                )
+                data = run_upstream()
 
             outputs = data.get("outputs") or []
             url_count = sum(1 for o in outputs if o.get("url"))
@@ -402,6 +625,8 @@ def _run_job(job_id: str) -> None:
                 result=data.get("result"),
                 finished_at=time.time(),
             )
+            # 上游完整成功 → 当前账号 OK, 释放给池子.
+            fp.release_token(ok=True)
             # ── (3a) 创建成功：返回文件地址 ─────────────────────
             db.add_log(
                 job_id=job_id,
@@ -412,6 +637,7 @@ def _run_job(job_id: str) -> None:
                 response_body={
                     "task_id": data.get("task_id"),
                     "poll_url": data.get("poll_url"),
+                    "account": data.get("account_label") or "",
                     "files": [
                         {
                             "type": o.get("type"),
@@ -429,7 +655,10 @@ def _run_job(job_id: str) -> None:
         except Exception as e:
             tb = traceback.format_exc()
             err_msg = str(e)
-            user_msg = fp.summarize_upstream_error(err_msg)
+            user_msg = fp.summarize_upstream_error(e)
+            upstream_error = fp.upstream_error_details(e)
+            # 把异常归类上报给连接池: 401/403/quota 等会自动 cooldown, 下一请求换账号.
+            fp.release_token(ok=False, error=err_msg)
             # 完整堆栈只打印到服务器 stderr, 不写进任何用户可见字段。
             sys.stderr.write(f"[JOB FAILED] {job_id} ({kind}) {type(e).__name__}: {err_msg}\n")
             traceback.print_exc(file=sys.stderr)
@@ -438,14 +667,24 @@ def _run_job(job_id: str) -> None:
                 status="failed",
                 message=user_msg,
                 progress=100,
+                error=user_msg,
                 finished_at=time.time(),
             )
             # ── (3b) 创建失败：异常原因 ─────────────────────────
-            # 仅写归一化文案 + 异常类型名, 不暴露原始堆栈或 task_id 详情。
             log_payload = {
                 "user_message": user_msg,
                 "error_type": type(e).__name__,
+                "account_id": fp.current_account_id() or "",
             }
+            if isinstance(e, fp.UpstreamTaskFailed):
+                # 终态失败的上游 payload 是定位额度/权限/审核问题所需的最小证据。
+                log_payload["upstream_terminal"] = {
+                    k: e.payload.get(k)
+                    for k in ("status", "state", "status_code", "code", "error", "message", "reason")
+                    if e.payload.get(k) is not None
+                }
+            if upstream_error:
+                log_payload["upstream_error"] = upstream_error
             db.add_log(
                 job_id=job_id,
                 phase="task_failed",
@@ -461,17 +700,51 @@ def _run_job(job_id: str) -> None:
 
 # ── routes ───────────────────────────────────────────────────
 
+def _page_arg(raw: str | None, default: int, *, maximum: int) -> int:
+    try:
+        value = int(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        value = default
+    return max(0, min(value, maximum))
+
 @app.get("/outputs/<path:filename>")
 def api_outputs(filename: str):
     """从 outputs/ 目录读取文件（成片 / TTS / 关键帧）。"""
     from flask import send_from_directory, abort
     base = OUT_DIR.resolve()
     target = (base / filename).resolve()
-    if not str(target).startswith(str(base)):
+    try:
+        target.relative_to(base)
+    except ValueError:
         abort(404)
     if not target.exists() or not target.is_file():
         abort(404)
     return send_from_directory(base, filename, conditional=True)
+
+
+def _output_url(path: str | None) -> str:
+    """把服务端绝对路径转换为不泄露文件系统结构的公共 URL。"""
+    if not path:
+        return ""
+    base = OUT_DIR.resolve()
+    try:
+        rel = Path(path).resolve().relative_to(base)
+    except (OSError, ValueError):
+        return ""
+    return "/outputs/" + quote(rel.as_posix(), safe="/")
+
+
+def _cleanup_job_artifacts(job_id: str) -> None:
+    """删除指定成片任务的本地中间文件，且严格限制在 outputs 子目录内。"""
+    for root in (OUT_DIR / "videos", OUT_DIR / "tts"):
+        root = root.resolve()
+        target = (root / job_id).resolve()
+        if target.parent != root or not target.is_dir():
+            continue
+        try:
+            shutil.rmtree(target)
+        except OSError as exc:
+            sys.stderr.write(f"[cleanup] {target}: {exc}\n")
 
 @app.get("/api/health")
 def api_health():
@@ -480,7 +753,7 @@ def api_health():
         {
             "ok": True,
             "auth": _auth_status(),
-            "credits": _credits_status(),
+            "credits": _credits_snapshot(),
             "time": time.time(),
         }
     )
@@ -545,11 +818,12 @@ def api_generate():
         version = str((hit or {}).get("version") or ("2" if kind == "image" else "1"))
 
     auth = _auth_status()
-    if not auth.get("storage_exists") and not auth.get("token_ok"):
+    if not auth.get("token_ok"):
         return (
             jsonify(
                 {
-                    "error": "未登录。请先运行: python token_daemon.py --start",
+                    "error": "账号池为空. 请到「账号池」页面上传 token_file "
+                    "(必填) + cookie_file (可选).",
                     "auth": auth,
                 }
             ),
@@ -593,13 +867,21 @@ def api_generate():
         status_code=202,
         request_body=params,
     )
-    threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
+    if not _enqueue_job(job_id, "generate"):
+        db.update_job(
+            job_id,
+            status="failed",
+            message="任务队列已满，请稍后重试。",
+            progress=100,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": "任务队列已满，请稍后重试。", "job_id": job_id}), 429
     return jsonify({"job_id": job_id, "job": _public_job(job)}), 202
 
 @app.get("/api/jobs")
 def api_jobs():
-    limit = int(request.args.get("limit") or 50)
-    offset = int(request.args.get("offset") or 0)
+    limit = _page_arg(request.args.get("limit"), 50, maximum=100)
+    offset = _page_arg(request.args.get("offset"), 0, maximum=1_000_000)
     items = db.list_jobs(limit=limit, offset=offset)
     return jsonify({"jobs": [_public_job(j) for j in items], "count": len(items)})
 
@@ -612,16 +894,20 @@ def api_job(job_id: str):
 
 @app.delete("/api/jobs/<job_id>")
 def api_job_delete(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
     ok = db.delete_job(job_id)
     if not ok:
         return jsonify({"error": "job not found"}), 404
+    _cleanup_job_artifacts(job_id)
     return jsonify({"ok": True})
 
 @app.get("/api/logs")
 def api_logs():
     job_id = request.args.get("job_id") or None
-    limit = int(request.args.get("limit") or 100)
-    offset = int(request.args.get("offset") or 0)
+    limit = _page_arg(request.args.get("limit"), 100, maximum=200)
+    offset = _page_arg(request.args.get("offset"), 0, maximum=1_000_000)
     items = db.list_logs(job_id=job_id, limit=limit, offset=offset)
     return jsonify({"logs": items, "count": len(items)})
 
@@ -693,6 +979,184 @@ def api_llm_models():
     except Exception as e:
         return jsonify({"models": [], "count": 0, "default": cfg.model, "error": str(e)}), 502
 
+
+# ── accounts pool ────────────────────────────────────────────
+
+_ALLOWED_UPLOAD_SUFFIX = {".json"}
+_MAX_UPLOAD_BYTES = 512 * 1024  # 512 KB 上限 (cookie 文件通常 < 200KB)
+
+
+def _read_upload(file_storage, *, field: str) -> dict[str, Any] | None:
+    """读 multipart 上传的 JSON 文件. 失败抛 ValueError."""
+    import json
+
+    if file_storage is None or not file_storage.filename:
+        return None
+    name = str(file_storage.filename)
+    suffix = Path(name).suffix.lower()
+    if suffix not in _ALLOWED_UPLOAD_SUFFIX:
+        raise ValueError(f"{field}: 仅支持 .json 文件 (收到 {name})")
+    raw = file_storage.read(_MAX_UPLOAD_BYTES + 1)
+    if len(raw) > _MAX_UPLOAD_BYTES:
+        raise ValueError(f"{field}: 文件超过 {_MAX_UPLOAD_BYTES // 1024}KB 上限")
+    try:
+        data = json.loads(raw.decode("utf-8-sig") or "{}")
+    except Exception as e:
+        raise ValueError(f"{field}: JSON 解析失败: {e}")
+    if not isinstance(data, dict):
+        raise ValueError(f"{field}: 顶层必须是 JSON 对象")
+    return data
+
+
+@app.get("/api/accounts")
+def api_accounts_list():
+    """列出所有账号 (含健康状态). 不返回 token / cookies 原文."""
+    pool = get_pool()
+    items = []
+    for account in pool.list():
+        item = account.public_dict()
+        item["credits"] = (
+            _account_credits_status(account)
+            if item["healthy"]
+            else {"error": "账号当前不可用", "updated_at": 0}
+        )
+        items.append(item)
+    return jsonify({"accounts": items, "count": len(items), "pool": pool.status()})
+
+
+@app.post("/api/accounts/upload")
+def api_accounts_upload():
+    """上传 token / cookie；cookie-only 时立即走 IMS 换 token 后入池。"""
+    label = (request.form.get("label") or "").strip()
+    if not label:
+        return jsonify({"error": "label 不能为空"}), 400
+    try:
+        token_payload = _read_upload(request.files.get("token_file"), field="token_file")
+        cookie_payload = _read_upload(request.files.get("cookie_file"), field="cookie_file")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not token_payload and not cookie_payload:
+        return jsonify({"error": "请至少上传 token_file 或 cookie_file"}), 400
+
+    cookies: list[dict[str, Any]] = []
+    if cookie_payload:
+        # storage.json 格式: {"cookies": [...]}; 兼容只放 cookies 数组的形式
+        if isinstance(cookie_payload.get("cookies"), list):
+            cookies = [c for c in cookie_payload["cookies"] if isinstance(c, dict)]
+        elif isinstance(cookie_payload.get("cookies"), dict):
+            # playwright 单 cookie dict 转 list
+            cookies = [cookie_payload["cookies"]]
+
+    try:
+        if token_payload:
+            acct = get_pool().add_from_files(
+                token_payload=token_payload,
+                cookies=cookies,
+                label=label,
+            )
+        else:
+            if not cookies:
+                return jsonify({"error": "cookie_file 中找不到 cookies 数组"}), 400
+            refreshed = fp.ims_refresh_token(
+                client_id=fp.API_KEY_CLIO,
+                origin=fp.ORIGIN_FIREFLY,
+                cookies=cookies,
+            )
+            if not refreshed:
+                return jsonify({"error": "cookie 无法换取 IMS token，请确认已登录且未过期"}), 400
+            token, meta = refreshed
+            claims = fp.decode_jwt_payload(token)
+            acct = get_pool().add(
+                token=token,
+                label=label,
+                cookies=cookies,
+                client_id=str(claims.get("client_id") or fp.API_KEY_CLIO),
+                expires_at=time.time() + int(meta.get("expires_in") or 86000),
+                source="cookie_refresh",
+            )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "account": acct.public_dict()}), 201
+
+
+# 必须先注册字面量路由, 不然 Flask 把它当 <account_id> 匹配后返回 405.
+@app.post("/api/accounts/migrate-legacy")
+def api_accounts_migrate_legacy_removed():
+    """占位: 旧的一键迁移端点已停用. 改用 POST /api/accounts/upload."""
+    return jsonify({
+        "error": "该端点已停用. 请用 POST /api/accounts/upload 上传 token_file.",
+    }), 410
+
+
+@app.delete("/api/accounts/<account_id>")
+def api_accounts_delete(account_id: str):
+    pool = get_pool()
+    if not pool.get(account_id):
+        return jsonify({"error": "account not found"}), 404
+    pool.remove(account_id)
+    return jsonify({"ok": True})
+
+
+@app.patch("/api/accounts/<account_id>")
+def api_accounts_patch(account_id: str):
+    body = request.get_json(force=True, silent=True) or {}
+    label = body.get("label")
+    disabled = body.get("disabled")
+    try:
+        acct = get_pool().update(
+            account_id,
+            label=str(label).strip() if isinstance(label, str) else None,
+            disabled=bool(disabled) if isinstance(disabled, bool) else None,
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not acct:
+        return jsonify({"error": "account not found"}), 404
+    return jsonify({"ok": True, "account": acct.public_dict()})
+
+
+@app.post("/api/accounts/<account_id>/refresh")
+def api_accounts_refresh(account_id: str):
+    """用账号自带的 cookies 调 IMS check/v6 刷 token; 成功则覆盖 token + 重置冷却."""
+    pool = get_pool()
+    acct = pool.get(account_id)
+    if not acct:
+        return jsonify({"error": "account not found"}), 404
+    if not acct.cookies:
+        return jsonify({"error": "该账号未提供 cookie 文件, 无法 IMS 刷新"}), 400
+
+    prefer = acct.client_id or fp.API_KEY_CLIO
+    origin = fp.ORIGIN_EXPRESS if prefer == fp.API_KEY_PROJECTX else fp.ORIGIN_FIREFLY
+    refreshed = fp.ims_refresh_token(
+        client_id=prefer,
+        origin=origin,
+        cookies=acct.cookies,
+    )
+
+    if not refreshed:
+        pool.mark_refresh_failure(
+            account_id,
+            seconds=60,
+            error="IMS refresh failed (cookie expired?)",
+        )
+        return jsonify({"ok": False, "error": "IMS 刷新失败 (cookie 已过期?)"}), 502
+
+    tok, meta = refreshed
+    claims = fp.decode_jwt_payload(tok)
+    exp_in = int(meta.get("expires_in") or 86000)
+    new_cid = str(claims.get("client_id") or acct.client_id or prefer)
+    pool.set_token(
+        account_id,
+        token=tok,
+        expires_at=time.time() + exp_in,
+        client_id=new_cid,
+    )
+    # 刷新成功 → 立即给账号解除 cooldown
+    pool.mark_refreshed(account_id)
+    fresh = pool.get(account_id)
+    return jsonify({"ok": True, "account": fresh.public_dict() if fresh else None})
+
+
 def _run_video_job(job_id: str) -> None:
     """后台跑 video_pipeline.generate_full_video，并把结果写回 SQLite。"""
     with _executor_sema:
@@ -741,13 +1205,40 @@ def _run_video_job(job_id: str) -> None:
                 method="INTERNAL", url="video_pipeline",
                 status_code=0, request_body={"prompt": prompt, "options": params.get("options") or {}},
             )
-            result = vp.generate_full_video(
-                prompt,
-                options_dict=params.get("options") or {},
-                on_progress=_on_progress,
-                on_state=_on_state,
-                job_id=job_id,
-            )
+
+            def run_video() -> dict[str, Any]:
+                return vp.generate_full_video(
+                    prompt,
+                    options_dict=params.get("options") or {},
+                    on_progress=_on_progress,
+                    on_state=_on_state,
+                    job_id=job_id,
+                )
+
+            try:
+                result = run_video()
+            except Exception as first_error:
+                if not fp.is_retryable_upstream_error(first_error):
+                    raise
+                fp.release_token(ok=False, error=str(first_error))
+                db.add_log(
+                    job_id=job_id, phase="video_retry",
+                    method="INTERNAL", url="video_pipeline",
+                    status_code=0,
+                    response_body={
+                        "attempt": 1,
+                        "reason": type(first_error).__name__,
+                        "message": str(first_error)[:240],
+                    },
+                    duration_ms=(time.time() - t0) * 1000,
+                )
+                db.update_job(
+                    job_id,
+                    status="running",
+                    message="上游失败，切换账号后自动重试…",
+                    progress=5,
+                )
+                result = run_video()
             shots = result.get("shots") or []
             # 把分镜 URL 也作为 outputs 暴露，前端现有 video 预览逻辑就能用
             outputs: list[dict[str, Any]] = []
@@ -814,6 +1305,7 @@ def _run_video_job(job_id: str) -> None:
                 },
                 finished_at=time.time(),
             )
+            fp.release_token(ok=True)
             db.add_log(
                 job_id=job_id, phase="video_succeeded",
                 method="INTERNAL", url="video_pipeline",
@@ -823,17 +1315,20 @@ def _run_video_job(job_id: str) -> None:
                     "final_video_path": final_path,
                     "duration_sec": result.get("ffprobe_duration_total") or 0,
                     "errors": errs,
+                    "account": fp.current_account_label(),
                 },
                 duration_ms=(time.time() - t0) * 1000,
             )
         except Exception as e:
             tb = traceback.format_exc()
             err_msg = str(e)
+            fp.release_token(ok=False, error=err_msg)
             # TTS 错误用专门文案；其它走 fp.summarize_upstream_error
             if "TTS" in err_msg or "tts" in err_msg.lower():
                 user_msg = vp.summarize_tts_error(err_msg)
             else:
-                user_msg = fp.summarize_upstream_error(err_msg)
+                user_msg = fp.summarize_upstream_error(e)
+            upstream_error = fp.upstream_error_details(e)
             sys.stderr.write(f"[VIDEO JOB FAILED] {job_id} {type(e).__name__}: {err_msg}\n")
             traceback.print_exc(file=sys.stderr)
             db.update_job(
@@ -841,14 +1336,27 @@ def _run_video_job(job_id: str) -> None:
                 status="failed",
                 message=user_msg,
                 progress=100,
+                error=user_msg,
                 finished_at=time.time(),
             )
+            video_log_payload: dict[str, Any] = {
+                "error_type": type(e).__name__,
+                "account_id": fp.current_account_id() or "",
+            }
+            if isinstance(e, fp.UpstreamTaskFailed):
+                video_log_payload["upstream_terminal"] = {
+                    k: e.payload.get(k)
+                    for k in ("status", "state", "status_code", "code", "error", "message", "reason")
+                    if e.payload.get(k) is not None
+                }
+            if upstream_error:
+                video_log_payload["upstream_error"] = upstream_error
             db.add_log(
                 job_id=job_id, phase="video_failed",
                 method="INTERNAL", url="video_pipeline",
                 status_code=500,
                 error=user_msg,
-                response_body={"error_type": type(e).__name__},
+                response_body=video_log_payload,
                 duration_ms=(time.time() - t0) * 1000,
             )
 
@@ -898,10 +1406,11 @@ def api_video_generate():
         return jsonify({"error": err}), 400
 
     auth = _auth_status()
-    if not auth.get("storage_exists") and not auth.get("token_ok"):
+    if not auth.get("token_ok"):
         return (
             jsonify({
-                "error": "未登录。请先运行: python token_daemon.py --start",
+                "error": "账号池为空. 请到「账号池」页面上传 token_file "
+                "(必填) + cookie_file (可选).",
                 "auth": auth,
             }),
             400,
@@ -938,7 +1447,15 @@ def api_video_generate():
         method="POST", url="/api/video/generate",
         status_code=202, request_body=params,
     )
-    threading.Thread(target=_run_video_job, args=(job_id,), daemon=True).start()
+    if not _enqueue_job(job_id, "video_pipeline"):
+        db.update_job(
+            job_id,
+            status="failed",
+            message="任务队列已满，请稍后重试。",
+            progress=100,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": "任务队列已满，请稍后重试。", "job_id": job_id}), 429
     return jsonify({"job_id": job_id, "job": _public_job(job)}), 202
 
 @app.get("/api/video/<job_id>")
@@ -949,8 +1466,8 @@ def api_video_get(job_id: str):
         return jsonify({"error": "job not found"}), 404
     pub = _public_job(job) or {}
     result = job.get("result") or {}
-    pub["final_video_path"] = result.get("final_video_path") or ""
-    pub["manifest_path"] = result.get("manifest_path") or ""
+    pub["final_video_path"] = _output_url(result.get("final_video_path"))
+    pub["manifest_path"] = _output_url(result.get("manifest_path"))
     pub["shots"] = result.get("shots") or []
     pub["used_ffmpeg"] = bool(result.get("used_ffmpeg"))
     pub["ffprobe_duration_total"] = result.get("ffprobe_duration_total") or 0
@@ -960,6 +1477,8 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     recovered = _recover_orphaned_jobs()
+    pool = get_pool()
+    pool_summary = pool.status()
     try:
         by_kind, source, err = _get_models_by_kind(force_live=False)
         total = sum(len(v) for v in by_kind.values())
@@ -979,6 +1498,11 @@ def main() -> None:
     print(f"[Firefly API] http://{host}:{port}")
     print(f"  db={DB_PATH}")
     print(f"  recovered_orphans={recovered}")
+    print(
+        f"  accounts_pool: size={pool_summary['size']} available={pool_summary['available']}"
+        + (" (池为空, 所有请求都会 400; 请到「账号池」页面上传)"
+           if pool_summary["size"] == 0 else "")
+    )
     print(f"  cors={_cors_origins}")
     if cors_warn:
         print(cors_warn)

@@ -236,6 +236,8 @@ def flatten_discovery_models(families: list[dict[str, Any]]) -> list[dict[str, A
             aspect = _str_enum(gen_set)
             # 只保留像比例的
             aspect = [a for a in aspect if ":" in a or a in ("square", "auto", "portrait", "landscape")]
+            # TODO: 从 discovery 返回的 modelSpecificPayload / JSON Schema 约束中解析每个模型
+            # 实际支持的长宽比；当前 schema 缺失时仍使用固定回退值，可能与模型能力不一致。
             if not aspect and kind in ("image", "video"):
                 aspect = ["1:1", "16:9", "9:16", "4:3", "3:4"] if kind == "image" else ["16:9", "9:16"]
 

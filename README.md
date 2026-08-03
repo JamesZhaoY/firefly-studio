@@ -4,20 +4,22 @@ Self-hosted web console for Adobe Firefly 3P image / video generation.
 
 - **Backend** Flask + SQLite (jobs + 调用日志)
 - **Frontend** React + Vite, teal-on-zinc dark UI with persistent left sidebar
-- **产物只记下载 URL**，服务端不落盘任何文件
+- **多账号连接池** round-robin + 失败自动冷却/切换（详见下文）
+- **普通生成**只记录下载 URL；**一键成片**会在 `outputs/` 保存合成视频和中间产物
 
 ```text
 adobe/
   app.py                  # Flask API :7860
   db.py                   # SQLite
   firefly_pipeline.py     # 上游 Firefly 客户端
+  token_pool.py           # 多账号连接池 (新增)
   models_catalog.py       # 模型展开 + 预设
   video_pipeline.py       # 一键成片（拆分 → 镜头视频 → TTS → 拼接）
   token_daemon.py         # Playwright 登录 + cookie 刷新
   tests/                  # 纯函数测试
   data/                   # 运行期数据（git 忽略）
-    storage.json
-    current_token.json
+    storage.json          # token_daemon 生成的 cookie（上传前的临时文件）
+    current_token.json    # token_daemon 生成的 token（上传前的临时文件）
     firefly.db
   frontend/               # React + Vite
     src/
@@ -43,19 +45,31 @@ npm install
 
 ## 启动
 
-### 1) 登录拿 cookie（首次 / cookie 失效时）
+### 1) 上传账号（首次 / 新增账号）
+
+打开前端 **账号池** 页面，上传 `current_token.json`（必填）+ `storage.json`（可选）即可。
+不再从本地 `data/current_token.json` / `data/storage.json` 自动读取 —— 所有凭证由本页面统一管理。
+token 文件可通过 `token_daemon.py --start` 拿到，或直接复用现有 IMS 刷新脚本的产物。
 
 ```bash
+# 仅在需要拿新 token 时跑（仍可单独用）
 python token_daemon.py --start
+# Chrome 弹出 → 在 firefly.adobe.com 解 CAPTCHA + 登录 →
+# 自动写 data/current_token.json + data/storage.json
+# 把这两个文件拿到前端「账号池」页面上传即可
 ```
-
-Chrome 弹出 → 在 `firefly.adobe.com` 解 CAPTCHA + 登录 → 自动写 `data/storage.json` 和 `data/current_token.json`。可 `Ctrl+C` 退出，后台刷新可单独跑 `python token_daemon.py --run`。
 
 ### 2) 启动后端
 
 ```bash
 python app.py
 # http://127.0.0.1:7860
+```
+
+启动时若 pool 为空会打印：
+
+```
+accounts_pool: size=0 available=0 (池为空, 所有请求都会 400; 请到「账号池」页面上传)
 ```
 
 ### 3) 启动前端
@@ -85,7 +99,7 @@ npm run dev
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/health` | 健康检查 / 登录态 |
+| GET | `/api/health` | 健康检查 / 登录态 / pool 摘要 |
 | GET | `/api/models` | 模型列表（`?refresh=1` 强制上游） |
 | POST | `/api/generate` | 提交生成（异步） |
 | GET | `/api/jobs` | 任务列表 |
@@ -98,6 +112,11 @@ npm run dev
 | GET | `/api/video/<job_id>` | 一键成片任务详情（含 `final_video_path`） |
 | GET | `/api/voices` | TTS 可用语音列表（Microsoft Edge TTS via `edge-tts`） |
 | GET | `/api/llm-models` | 从 LLM 服务的 `/v1/models` 获取分镜模型列表 |
+| GET  | `/api/accounts` | 列出账号池 + 健康状态 |
+| POST | `/api/accounts/upload` | 上传一个账号（multipart: `token_file` + 可选 `cookie_file` + `label`） |
+| DELETE | `/api/accounts/<id>` | 删除账号 |
+| PATCH | `/api/accounts/<id>` | 重命名 / 启停 `{label?, disabled?}` |
+| POST | `/api/accounts/<id>/refresh` | 用本账号 cookie 强制 IMS 刷 token |
 | GET | `/outputs/<path>` | 读取本地产物（成片 / 关键帧 / TTS） |
 
 ### 生成示例
@@ -218,9 +237,66 @@ Docker Desktop 中本地 LLM 跑在宿主机时，曾由 Compose 将 `LLM_BASE_U
 | phase | 内容 |
 |-------|------|
 | `request_params` | 归一化后的请求参数 |
-| `task_created` | 上游返回的 task_id / poll_url / HTTP code |
+| `task_created` | 上游返回的 task_id / poll_url / HTTP code + 命中账号 |
 | `task_succeeded` | 成功：files 数组（URL + 类型） |
 | `task_failed` + `task_traceback` | 失败：异常类型 / 上游错误码 / Python 堆栈 |
+
+---
+
+## 多账号连接池
+
+> 多账号上传即自动负载均衡：每个请求从健康账号中轮询取一个；上游报错（401/quota/限流）
+> 自动按错误类型设置冷却时间，下个请求自动选下一个健康账号。
+
+### 上传账号（推荐路径）
+
+打开前端 **账号池** 页 → 选 `current_token.json`（必填）+ `storage.json`（可选）+ 标签 → 上传。
+标签重名会自动加 `(2)` 后缀。也可调 API：
+
+```bash
+curl -X POST http://127.0.0.1:7860/api/accounts/upload \
+  -F "label=alice" \
+  -F "token_file=@./current_token.json" \
+  -F "cookie_file=@./storage.json"
+```
+
+### 一键迁移老的单账号
+
+迁移路径已移除。所有账号必须通过 `POST /api/accounts/upload` 上传；
+不再从 `data/current_token.json` / `data/storage.json` 自动读取。
+
+### 负载均衡 + 失败冷却
+
+| 错误关键字 | 冷却时长 | 原因 |
+|------|------|------|
+| `401 / 403 / unauthorized / expired` | 60s | 鉴权问题（cookie 即将刷新） |
+| `quota / credit / taste_exhausted / rate / limit` | 300s | 余额/限流，强制等额度重置 |
+| `500 / 502 / 503 / 504` | 30s | 上游暂时不可用 |
+| `408 / timeout / network` | 10s | 瞬时网络 |
+| 其它 | 10s | 兜底 |
+
+冷却时长随连续失败次数指数叠加（封顶 15 分钟）。轮询取号时跳过：
+- `disabled=true`
+- 冷却未结束
+- 已过期
+
+### 强制 IMS 刷新
+
+每个账号可单独调 `POST /api/accounts/<id>/refresh` 用它自己的 cookie 刷 token；
+成功后清空该账号的冷却。批量调度 / 守护可基于此自建。
+
+### 落盘格式
+
+账号凭证全部保存到 `data/firefly.db` 的 `accounts` 表，不再写入或读取
+`data/accounts/*.json`。token/cookie 在 SQLite 的 `payload_json` 列中持久化，
+不通过账号列表 API 返回。
+
+健康度（cooldown、连续失败次数、统计）只在内存里，不落盘——重启后回到初始健康。
+
+### 向后兼容
+
+无。`data/current_token.json` / `data/storage.json` 不再被服务自动读取，
+所有账号必须通过上传接口进入 pool；老的 daemon 脚本只用来**生成**这两个文件供上传使用。
 
 ---
 
@@ -230,6 +306,7 @@ Docker Desktop 中本地 LLM 跑在宿主机时，曾由 Compose 将 `LLM_BASE_U
 
 - `jobs` — 任务状态、参数、outputs（URL JSON）
 - `api_logs` — 每次生成的 4 个阶段
+- `accounts` — 管理端上传的 token / cookie 账号池凭证
 
 ---
 
@@ -241,12 +318,18 @@ Docker Desktop 中本地 LLM 跑在宿主机时，曾由 Compose 将 `LLM_BASE_U
 | `FLASK_PORT` | `7860` | API 端口 |
 | `FLASK_DEBUG` | `0` | Flask debug 开关 |
 | `VITE_API_BASE` | 空（走代理） | 前端直连 API 时设 `http://127.0.0.1:7860` |
-| `FIREFLY_STORAGE` | `data/storage.json` | Playwright cookie |
-| `FIREFLY_TOKEN_FILE` | `data/current_token.json` | IMS token 缓存 |
+| `ADMIN_API_KEY` | 空（本地开发不校验） | API 管理密钥；`FLASK_PUBLIC=1` 时必填 |
+| `VITE_ADMIN_API_KEY` | 空 | 前端调用 API 时附带的管理密钥（仅适合受控的自托管环境） |
+| `JOB_WORKERS` | `2` | 后台任务 worker 数量 |
+| `JOB_QUEUE_SIZE` | `24` | 等待中的最大任务数 |
+| `FIREFLY_DB_PATH` | `data/firefly.db` | 账号池 SQLite 路径 |
 | `LLM_BASE_URL` | `http://127.0.0.1:8317/v1` | 一键成片 LLM 拆镜 base URL |
 | `LLM_API_KEY` | `local-dev-key` | 一键成片 LLM Bearer |
 | `LLM_MODEL` | `gpt-5.5` | 一键成片 LLM 模型 |
 | `LLM_TIMEOUT` | `20` | 一键成片 LLM 超时（秒） |
+
+> `FIREFLY_STORAGE` / `FIREFLY_TOKEN_FILE` / `FIREFLY_TOKEN` / `FIREFLY_OAUTH_TOKEN_FILE` 等老环境变量已不再被读取；
+> 账号信息只来自 SQLite `accounts` 表。
 
 ---
 
@@ -279,6 +362,10 @@ python video_pipeline.py "首先薄雾升起，然后小鹿出现，最后阳光
   - `firefly-studio.service` 与可选的 `firefly-studio-token.service` 由 systemd 管理
   - 阿里云安全组放行 `19999/TCP` 入站
 
+公网部署时设置 `FLASK_PUBLIC=1` 与 `ADMIN_API_KEY`，并把 Nginx `/api/` 代理中的
+`X-Admin-Key` 配成同一个值。前端直连 API（不经过该 Nginx 注入）时，再构建时设置
+`VITE_ADMIN_API_KEY`。
+
 ---
 
 ## 常见问题
@@ -287,6 +374,6 @@ python video_pipeline.py "首先薄雾升起，然后小鹿出现，最后阳光
 - **CORS 跨域**：默认 `*`。生产可设环境变量 `CORS_ORIGINS=https://your-frontend.example`。
 - **curl_cffi 没装**：TLS 指纹不像浏览器，会触发 408。`pip install curl_cffi`。
 
-- **408 system under load**：token client_id 与 `x-api-key` 不匹配 / 缺 `x-arp-session-id` / 没装 `curl_cffi` 等。本仓库默认选 token 文件里的 client_id 并自动生成 base64 arp。
-- **额度耗尽**：上游返回 `401/403` + header `x-access-error=taste_exhausted`，前端会显示对应文案。
-- **playwright 没装浏览器**：`playwright install chromium`。
+- **408 system under load**：token client_id 与 `x-api-key` 不匹配 / 缺 `x-arp-session-id` / 没装 `curl_cffi` 等。本仓库默认选上传账号里的 client_id 并自动生成 base64 arp。
+- **额度耗尽**：上游返回 `401/403` + header `x-access-error=taste_exhausted`，该账号会被自动 cooldown 300s 并切到下一个账号；若全部账号都耗尽，任务会 failed 并显示「上游额度已用完」。
+- **playwright 没装浏览器**：`playwright install chromium`（仅在需要 `python token_daemon.py --start` 拿新 token 时才用得到）。
