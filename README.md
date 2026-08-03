@@ -207,9 +207,9 @@ curl http://127.0.0.1:7860/api/video/<job_id>
 | `LLM_MODEL` | `gpt-5.5` | 模型名 |
 | `LLM_TIMEOUT` | `20` | 单次请求超时（秒） |
 
-Docker Desktop 中本地 LLM 跑在宿主机时，Compose 已将 `LLM_BASE_URL` 配置为
-`http://host.llm:8317/v1`。该别名通过 Docker `host-gateway` 注入，避免 WARP
-sidecar 重写 `host.docker.internal`；容器内的 `127.0.0.1` 只指向容器自身。
+Docker Desktop 中本地 LLM 跑在宿主机时，曾由 Compose 将 `LLM_BASE_URL` 配置为
+`http://host.llm:8317/v1` 以避开容器内 `127.0.0.1`。手动部署下，宿主机直接
+跑 LLM 服务即可，无需别名。
 
 ### 调用日志阶段
 
@@ -274,10 +274,10 @@ python video_pipeline.py "首先薄雾升起，然后小鹿出现，最后阳光
 ## 生产部署
 
 - **本地开发**：`python app.py` + `cd frontend && npm run dev`，全部 127.0.0.1 访问
-- **Docker 自托管**（ECS / VPS）：见 `docker-deploy.md`
-  - **单容器方案**：Nginx :19999 服务前端 + 反代 `/api/*` → Gunicorn :19998 → curl_cffi → Adobe
-  - 出口 Adobe 流量经 **Cloudflare WARP sidecar**（绕开国内 ISP 阻断）
-  - ECS 安全组开 19999 入站；可叠加 CF Tunnel / 域名 / Caddy HTTPS
+- **手动 systemd 部署**（ECS / VPS）：见 `manual-deploy.md`
+  - `nginx`（:19999）服务前端静态 + 反代 `/api/*` → `gunicorn`（:19998）
+  - `firefly-studio.service` 与可选的 `firefly-studio-token.service` 由 systemd 管理
+  - 阿里云安全组放行 `19999/TCP` 入站
 
 ---
 
