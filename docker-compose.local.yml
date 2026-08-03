@@ -1,15 +1,7 @@
 name: firefly-studio
 
-# Architecture (one container, no WARP sidecar):
-#
-#   user → host:19999 (公网IP/本地回环) ─► [nginx :19999]
-#                                              ├─ /             → React static (build)
-#                                              └─ /api/*        → gunicorn :19998 (Flask)
-#                                                              └─ curl_cffi → host's VPN → Adobe
-#
-# Use this file when the Docker host already has a VPN / proxy tunnel
-# to Adobe. Outbound traffic inherits the host's network and reaches
-# Adobe directly via the VPN, so no sidecar is required.
+# Local-deploy compose. Assumes the Docker host already has a VPN tunnel
+# (e.g. Clash TUN) for Adobe / Edge TTS, so no sidecar is required.
 
 services:
   app:
@@ -28,11 +20,5 @@ services:
       FLASK_DEBUG: "0"
       PYTHONUNBUFFERED: "1"
       CORS_ORIGINS: "*"
-      # 容器内 127.0.0.1 指向自身；本地 LLM 在宿主机时走 Docker Desktop 网关。
-      LLM_BASE_URL: "http://host.docker.internal:8317/v1"
-      LLM_API_KEY: "local-dev-key"
-      LLM_MODEL: "gpt-5.5"
-      NO_PROXY: "localhost,127.0.0.1,host.docker.internal,host.llm"
-      no_proxy: "localhost,127.0.0.1,host.docker.internal,host.llm"
       STORAGE_JSON: ""
       TOKEN_JSON: ""
