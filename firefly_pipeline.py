@@ -52,7 +52,7 @@ DEFAULT_TOKEN_FILE = DATA_DIR / "current_token.json"
 from token_pool import Account, TokenPool, get_pool as _get_pool  # noqa: E402
 
 # Thread-local: 记住本线程最近 acquire 的账号, 供 release_token() 使用.
-# 旧调用方仍可调用 require_token() 不感知 pool; 成功/失败在 finally 里 release 即可.
+# 元数据请求可传 record_stats=False 归还账号但不影响「生成成功/失败」统计.
 _TLS = threading.local()
 _POOL_REFRESH_LOCK = threading.Lock()
 
@@ -299,15 +299,23 @@ def acquire_token() -> tuple[str, dict, Account]:
     return acct.token, extras, acct
 
 
-def release_token(ok: bool, error: str = "") -> bool:
-    """上报当前线程最近一次 acquire 的结果. 没 acquire 过或 legacy 模式 → False (no-op)."""
+def release_token(
+    ok: bool,
+    error: str = "",
+    *,
+    record_stats: bool = True,
+) -> bool:
+    """归还当前线程最近一次账号租约。
+
+    record_stats=False 仍会更新账号可用性 / 冷却，但不会影响生成成功、失败次数。
+    """
     release_fn = getattr(_TLS, "release_fn", None)
     if release_fn is None:
         _TLS.account_id = None
         _TLS.account_label = None
         return False
     try:
-        release_fn(ok, error)
+        release_fn(ok, error, record_stats=record_stats)
     finally:
         _TLS.release_fn = None
         _TLS.account_id = None

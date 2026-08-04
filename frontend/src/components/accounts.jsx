@@ -89,7 +89,7 @@ function AccountRow({ acct, busy, onToggle, onDelete, onRefresh, onRename }) {
         <span>来源: {acct.source}</span>
         <span>添加: {fmtTs(acct.added_at)}</span>
         {acct.expires_at > 0 && <span>过期: {fmtTs(acct.expires_at)}</span>}
-        <span>成功/失败: {acct.stats.succeeded} / {acct.stats.failed}</span>
+        <span>生成成功/失败: {acct.stats.succeeded} / {acct.stats.failed}</span>
         <span className={`account-credits ${acct.credits?.error ? 'err' : ''}`} title={acct.credits?.error || ''}>
           额度: {fmtCredits(acct.credits)}
         </span>

@@ -1,13 +1,5 @@
 // util: formatters and shared constants. No JSX, no state.
 
-export const SIZE_FALLBACK = {
-  '16:9': '854x480',
-  '9:16': '480x854',
-  '1:1': '720x720',
-  '4:3': '640x480',
-  '3:4': '480x640',
-}
-
 export function keyOf(m) {
   return `${m.id}@@${m.version}`
 }

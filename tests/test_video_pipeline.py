@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -218,6 +219,53 @@ def test_shot_state_serialized():
     _check("镜头状态序列化", payload["status"] == "running" and payload["stage"] == "tts")
 
 
+def test_shot_retries_after_model_spec_recovery():
+    plan = vp.ShotPlan(
+        index=1,
+        visual_prompt="a firefly",
+        narration="萤火虫",
+        duration_sec=5,
+    )
+    options = vp.VideoOptions(
+        video_model="firefly-video",
+        video_model_version="clineto",
+        aspect_ratio="16:9",
+        video_size="",
+    )
+    calls = []
+    recovered = []
+    original = vp.fp.generate_video
+
+    def fake_generate_video(*_args, **kwargs):
+        calls.append(kwargs.get("size"))
+        if len(calls) == 1:
+            raise RuntimeError(
+                "Allowed width, height combinations are: [(960, 540), (540, 960)]"
+            )
+        return {"outputs": []}
+
+    def recover(model, version, aspect, error):
+        recovered.append((model, version, aspect, str(error)))
+        return "16:9", "960x540"
+
+    vp.fp.generate_video = fake_generate_video
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            vp.generate_shot_video(
+                plan,
+                options,
+                work=Path(directory),
+                recover_model_spec=recover,
+            )
+    finally:
+        vp.fp.generate_video = original
+
+    _check("规格恢复回调被调用一次", len(recovered) == 1)
+    _check("当前分镜自动重试一次", len(calls) == 2)
+    _check("重试使用模型返回尺寸", calls[1] == {"width": 960, "height": 540})
+    _check("后续分镜复用恢复规格", options.video_size == "960x540")
+
+
 # ── status 逻辑（app.py 一致性） ─────────────────────────────
 
 
@@ -250,6 +298,7 @@ def main() -> int:
         test_concat_inputs_list_shape,
         test_ffmpeg_detection,
         test_shot_state_serialized,
+        test_shot_retries_after_model_spec_recovery,
         test_status_logic_only_final_file_succeeds,
     ]
     failed = 0

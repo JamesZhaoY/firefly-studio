@@ -807,6 +807,7 @@ def summarize_tts_error(payload: Any) -> str:
 
 ProgressFn = Callable[[float, str], None]
 StateFn = Callable[[list[dict[str, Any]], str], None]
+ModelSpecRecoveryFn = Callable[[str, str, str, Any], tuple[str, Any] | None]
 
 
 @dataclass
@@ -819,6 +820,7 @@ class VideoOptions:
     aspect_ratio: str = DEFAULT_ASPECT_RATIO
     video_model: str = DEFAULT_VIDEO_MODEL
     video_model_version: str = DEFAULT_VIDEO_MODEL_VERSION
+    video_size: Any = None
     generate_audio: bool = True  # 视频自带的音轨；和 TTS 配音是两套
     use_llm: bool = False        # True → 用 LLM 拆 storyboard（opt-in）
     llm_model: str = ""          # 覆盖 LLM 拆镜模型（空 = env LLM_MODEL）
@@ -831,28 +833,51 @@ def generate_shot_video(
     options: VideoOptions,
     *,
     work: Path,
+    recover_model_spec: ModelSpecRecoveryFn | None = None,
 ) -> tuple[str, Path | None]:
     """调 fp.generate_video（纯文生视频），下载到 work/<name>.<ext>。"""
     work.mkdir(parents=True, exist_ok=True)
-    aspect = options.aspect_ratio or DEFAULT_ASPECT_RATIO
-    size = dict(
-        fp.VIDEO_SIZE_BY_ASPECT.get(aspect) or fp.VIDEO_SIZE_BY_ASPECT["16:9"]
-    )
-    out = fp.generate_video(
-        plan.visual_prompt,
-        model=options.video_model,
-        model_version=options.video_model_version,
-        n=1,
-        seeds=None,
-        duration=options.duration_sec,
-        size=size,
-        aspect_ratio=aspect,
-        generate_audio=options.generate_audio,
-        negative_prompt=plan.negative_prompt or "",
-        poll_interval=options.poll_interval,
-        max_wait=options.max_wait,
-        download_dir=work,
-    )
+
+    def run_upstream() -> dict[str, Any]:
+        aspect = options.aspect_ratio or DEFAULT_ASPECT_RATIO
+        size = fp.parse_size(options.video_size)
+        if size is None:
+            size = dict(
+                fp.VIDEO_SIZE_BY_ASPECT.get(aspect) or fp.VIDEO_SIZE_BY_ASPECT["16:9"]
+            )
+        return fp.generate_video(
+            plan.visual_prompt,
+            model=options.video_model,
+            model_version=options.video_model_version,
+            n=1,
+            seeds=None,
+            duration=options.duration_sec,
+            size=size,
+            aspect_ratio=aspect,
+            generate_audio=options.generate_audio,
+            negative_prompt=plan.negative_prompt or "",
+            poll_interval=options.poll_interval,
+            max_wait=options.max_wait,
+            download_dir=work,
+        )
+
+    try:
+        out = run_upstream()
+    except Exception as first_error:
+        recovered = (
+            recover_model_spec(
+                options.video_model,
+                options.video_model_version,
+                options.aspect_ratio,
+                first_error,
+            )
+            if recover_model_spec
+            else None
+        )
+        if not recovered:
+            raise
+        options.aspect_ratio, options.video_size = recovered
+        out = run_upstream()
     outputs = out.get("outputs") or []
     for o in outputs:
         url = o.get("url")
@@ -906,6 +931,7 @@ def generate_full_video(
     *,
     on_progress: ProgressFn | None = None,
     on_state: StateFn | None = None,
+    recover_model_spec: ModelSpecRecoveryFn | None = None,
     job_id: str = "",
 ) -> dict[str, Any]:
     """主入口。返回：
@@ -929,6 +955,7 @@ def generate_full_video(
         video_model_version=str(
             options_dict.get("video_model_version") or DEFAULT_VIDEO_MODEL_VERSION
         ),
+        video_size=options_dict.get("video_size"),
         generate_audio=bool(options_dict.get("generate_audio", True)),
         use_llm=bool(options_dict.get("use_llm", False)),
         llm_model=str(options_dict.get("llm_model") or ""),
@@ -995,7 +1022,12 @@ def generate_full_video(
             on_progress(base + span * (i - 1) / n, f"分镜 {i}/{n}：生成视频")
         # 1) video（不做关键帧；缩略图后续从视频首帧抽）
         try:
-            shot.video_url, shot.video_path = generate_shot_video(plan, options, work=shot_work)
+            shot.video_url, shot.video_path = generate_shot_video(
+                plan,
+                options,
+                work=shot_work,
+                recover_model_spec=recover_model_spec,
+            )
         except Exception as e:
             shot.error += f"video:{type(e).__name__}:{e}; "
             errors.append(f"shot{i}.video: {e}")

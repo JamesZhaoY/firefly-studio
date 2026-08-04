@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import math
+import re
 from typing import Any
 
 
@@ -77,6 +80,8 @@ def _walk_schema_enums(node: Any, out: list[Any]) -> None:
     if isinstance(node, dict):
         if "enum" in node and isinstance(node["enum"], list):
             out.extend(node["enum"])
+        if "const" in node:
+            out.append(node["const"])
         for v in node.values():
             _walk_schema_enums(v, out)
     elif isinstance(node, list):
@@ -90,9 +95,16 @@ def _size_strings(size_schema: Any) -> list[str]:
     sizes: list[str] = []
     for item in found:
         if isinstance(item, dict) and "width" in item and "height" in item:
-            sizes.append(f"{item['width']}x{item['height']}")
-        elif isinstance(item, str) and "x" in item:
-            sizes.append(item)
+            try:
+                width, height = int(item["width"]), int(item["height"])
+            except (TypeError, ValueError):
+                continue
+            if width > 0 and height > 0:
+                sizes.append(f"{width}x{height}")
+        elif isinstance(item, str):
+            match = re.fullmatch(r"\s*(\d+)\s*[x×*]\s*(\d+)\s*", item, re.IGNORECASE)
+            if match:
+                sizes.append(f"{int(match.group(1))}x{int(match.group(2))}")
     # 去重保序
     seen = set()
     uniq = []
@@ -101,6 +113,153 @@ def _size_strings(size_schema: Any) -> list[str]:
             seen.add(s)
             uniq.append(s)
     return uniq
+
+
+_COMMON_ASPECT_RATIOS: tuple[tuple[str, float], ...] = (
+    ("21:9", 21 / 9),
+    ("16:9", 16 / 9),
+    ("4:3", 4 / 3),
+    ("1:1", 1.0),
+    ("3:4", 3 / 4),
+    ("9:16", 9 / 16),
+)
+
+
+def _aspect_from_size(size: str) -> str:
+    """把 960x540 等 discovery 尺寸转换为用户可选的常见长宽比。"""
+    if not isinstance(size, str) or "x" not in size.lower():
+        return ""
+    try:
+        width_text, height_text = size.lower().split("x", 1)
+        width, height = int(width_text), int(height_text)
+    except (TypeError, ValueError):
+        return ""
+    if width <= 0 or height <= 0:
+        return ""
+
+    ratio = width / height
+    for label, target in _COMMON_ASPECT_RATIOS:
+        if abs(ratio - target) / target <= 0.025:
+            return label
+
+    divisor = math.gcd(width, height)
+    return f"{width // divisor}:{height // divisor}"
+
+
+def _explicit_aspect_ratios(schema: Any) -> list[str]:
+    """只读取 aspectRatio 相关字段，避免误收集 Schema 中其它字符串枚举。"""
+    found: list[Any] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                normalized = re.sub(r"[^a-z]", "", str(key).lower())
+                if "aspectratio" in normalized:
+                    _walk_schema_enums(value, found)
+                    if isinstance(value, dict) and value.get("default") is not None:
+                        found.append(value.get("default"))
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(schema)
+    ratios: list[str] = []
+    seen: set[str] = set()
+    for value in found:
+        if not isinstance(value, str):
+            continue
+        ratio = value.strip()
+        if not ratio:
+            continue
+        if re.fullmatch(r"\d+\s*:\s*\d+", ratio):
+            ratio = ratio.replace(" ", "")
+        elif ratio.lower() not in ("auto", "square", "portrait", "landscape"):
+            continue
+        if ratio in seen:
+            continue
+        seen.add(ratio)
+        ratios.append(ratio)
+    return ratios
+
+
+def _aspect_ratios(schema: Any, sizes: list[str]) -> list[str]:
+    """合并 discovery 显式比例与尺寸推导比例，保持上游顺序并去重。"""
+    values = _explicit_aspect_ratios(schema)
+    values.extend(_aspect_from_size(size) for size in sizes)
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value and value != "auto" and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def _sizes_by_aspect(sizes: list[str]) -> dict[str, str]:
+    """为每个真实支持的长宽比选择 discovery 返回的首个合法尺寸。"""
+    out: dict[str, str] = {}
+    for size in sizes:
+        aspect = _aspect_from_size(size)
+        if aspect:
+            out.setdefault(aspect, size)
+    return out
+
+
+def video_capabilities_from_sizes(sizes: list[str]) -> dict[str, Any]:
+    """把模型返回的合法尺寸列表转换成前后端统一消费的能力字段。"""
+    clean: list[str] = []
+    seen: set[str] = set()
+    for value in sizes:
+        if not isinstance(value, str):
+            continue
+        match = re.fullmatch(r"\s*(\d+)\s*x\s*(\d+)\s*", value, re.IGNORECASE)
+        if not match:
+            continue
+        size = f"{int(match.group(1))}x{int(match.group(2))}"
+        if size not in seen:
+            seen.add(size)
+            clean.append(size)
+    aspects = _aspect_ratios({}, clean)
+    size_map = _sizes_by_aspect(clean)
+    return {
+        "sizes": ["auto", *clean] if clean else ["auto"],
+        "aspect_ratios": aspects,
+        "default_aspect_ratio": "16:9" if "16:9" in aspects else (aspects[0] if aspects else ""),
+        "sizes_by_aspect": size_map,
+    }
+
+
+def parse_allowed_video_sizes(payload: Any) -> list[str]:
+    """从 Adobe 验证错误中提取 allowed width/height 组合，不保留其它响应内容。"""
+    values = _size_strings(payload)
+    try:
+        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        text = str(payload)
+    lower = text.lower()
+    marker = lower.find("allowed width, height combinations")
+    if marker >= 0:
+        segment = text[marker : marker + 3000]
+        list_start = segment.find("[")
+        list_end = segment.find("]", list_start + 1) if list_start >= 0 else -1
+        if list_start >= 0 and list_end > list_start:
+            segment = segment[list_start : list_end + 1]
+        values.extend(
+            f"{int(width)}x{int(height)}"
+            for width, height in re.findall(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)", segment)
+        )
+    # 兼容 allowedDimensions: [{width, height}] 一类 JSON 响应。
+    elif "allowed" in lower and "dimension" in lower:
+        values.extend(
+            f"{int(width)}x{int(height)}"
+            for width, height in re.findall(
+                r'["\']?width["\']?\s*[:=]\s*(\d+).{0,80}?["\']?height["\']?\s*[:=]\s*(\d+)',
+                text,
+                re.IGNORECASE,
+            )
+        )
+    return video_capabilities_from_sizes(values)["sizes"][1:]
 
 
 def _int_enum(schema: Any) -> list[int]:
@@ -216,11 +375,15 @@ def flatten_discovery_models(families: list[dict[str, Any]]) -> list[dict[str, A
             if not isinstance(mods, list):
                 mods = [mods] if mods else []
             kind = _modality_to_kind([str(x) for x in mods])
-            props = ((ver_body.get("requestSchema") or {}).get("properties") or {})
+            request_schema = ver_body.get("requestSchema") or {}
+            if not isinstance(request_schema, dict):
+                request_schema = {}
+            props = (request_schema.get("properties") or {})
             if not isinstance(props, dict):
                 props = {}
 
-            sizes = _size_strings(props.get("size"))
+            # size 可能位于 modelSpecificPayload / anyOf / $defs 中，必须遍历完整 Schema。
+            sizes = _size_strings(request_schema)
             if sizes:
                 sizes = ["auto", *sizes]
             else:
@@ -231,15 +394,8 @@ def flatten_discovery_models(families: list[dict[str, Any]]) -> list[dict[str, A
             if kind == "video" and not durations:
                 durations = [4, 5, 6, 8, 10, 12]
 
-            aspect = []
             gen_set = props.get("generationSettings") or {}
-            aspect = _str_enum(gen_set)
-            # 只保留像比例的
-            aspect = [a for a in aspect if ":" in a or a in ("square", "auto", "portrait", "landscape")]
-            # TODO: 从 discovery 返回的 modelSpecificPayload / JSON Schema 约束中解析每个模型
-            # 实际支持的长宽比；当前 schema 缺失时仍使用固定回退值，可能与模型能力不一致。
-            if not aspect and kind in ("image", "video"):
-                aspect = ["1:1", "16:9", "9:16", "4:3", "3:4"] if kind == "image" else ["16:9", "9:16"]
+            aspect = _aspect_ratios(request_schema, sizes)
 
             n_schema = props.get("n") or {}
             n_vals = _int_enum(n_schema)
@@ -259,21 +415,7 @@ def flatten_discovery_models(families: list[dict[str, Any]]) -> list[dict[str, A
             except Exception:
                 default_dur_i = durations[0] if durations else None
 
-            size_map = {}
-            for s in sizes:
-                if s == "auto" or "x" not in s:
-                    continue
-                try:
-                    w, h = s.lower().split("x", 1)
-                    wi, hi = int(w), int(h)
-                    if wi == hi:
-                        size_map.setdefault("1:1", s)
-                    elif wi > hi:
-                        size_map.setdefault("16:9", s)
-                    else:
-                        size_map.setdefault("9:16", s)
-                except Exception:
-                    pass
+            size_map = _sizes_by_aspect(sizes)
 
             label = f"{model_id} / {ver_key}"
             if provider:

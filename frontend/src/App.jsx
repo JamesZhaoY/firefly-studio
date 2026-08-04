@@ -10,7 +10,7 @@ import { LogsPage } from './components/logs.jsx'
 import { AccountsPage } from './components/accounts.jsx'
 import { GhostButton } from './components/primitives.jsx'
 import VideoPanel from './components/video.jsx'
-import { keyOf, SIZE_FALLBACK } from './components/util.js'
+import { keyOf } from './components/util.js'
 import './App.css'
 
 export default function App() {
@@ -468,8 +468,8 @@ async function onDeleteAccount(id) {
       setDuration(selected.default_duration || durs[0])
       const aspects = selected.aspect_ratios?.length
         ? selected.aspect_ratios
-        : ['16:9', '9:16']
-      setAspect(selected.default_aspect_ratio || aspects[0])
+        : ['auto']
+      setAspect(selected.default_aspect_ratio || aspects[0] || 'auto')
       setAudio(selected.audio !== false)
     }
     setN(1)
@@ -521,7 +521,8 @@ async function onDeleteAccount(id) {
         )
         sizeStr = hit && hit !== 'auto' ? hit : ''
       }
-      body.size = sizeStr || SIZE_FALLBACK[body.aspect_ratio] || '854x480'
+      // 后端会基于同一份 discovery 能力再次校验并补全真实尺寸。
+      body.size = sizeStr || 'auto'
     }
     setBusy(true)
     showMsg('提交中...')

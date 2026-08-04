@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import hmac
 import queue
@@ -31,7 +32,9 @@ from models_catalog import (
     IMAGE_MODELS,
     VIDEO_MODELS,
     flatten_discovery_models,
+    parse_allowed_video_sizes,
     split_by_kind,
+    video_capabilities_from_sizes,
 )
 from token_pool import get_pool
 
@@ -59,6 +62,8 @@ _job_workers_lock = threading.Lock()
 _job_worker_count = max(1, int(os.environ.get("JOB_WORKERS", "2")))
 _executor_sema = threading.Semaphore(_job_worker_count)
 _models_cache: dict[str, Any] = {"ts": 0.0, "data": None, "error": ""}
+_model_capabilities_path = DATA_DIR / "model_capabilities.json"
+_model_capabilities_lock = threading.Lock()
 _credits_cache: dict[str, Any] = {"ts": 0.0, "data": {}}
 _account_credits_cache: dict[str, dict[str, Any]] = {}
 _credits_refresh_lock = threading.Lock()
@@ -98,6 +103,19 @@ def _latest_flat_path() -> Path | None:
 def _load_flat_from_disk() -> list[dict[str, Any]] | None:
     import json
 
+    raws = sorted(
+        [p for p in OUT_DIR.glob("models_*.json") if "flat" not in p.name],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if raws:
+        try:
+            families = json.loads(raws[0].read_text(encoding="utf-8"))
+            if isinstance(families, list):
+                return flatten_discovery_models(families)
+        except Exception:
+            pass
+    # 没有原始 discovery 时才回退旧 flat；原始数据可随解析器升级重新展开。
     path = _latest_flat_path()
     if path:
         try:
@@ -105,19 +123,6 @@ def _load_flat_from_disk() -> list[dict[str, Any]] | None:
             return data if isinstance(data, list) else None
         except Exception:
             pass
-    raws = sorted(
-        [p for p in OUT_DIR.glob("models_*.json") if "flat" not in p.name],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not raws:
-        return None
-    try:
-        families = json.loads(raws[0].read_text(encoding="utf-8"))
-        if isinstance(families, list):
-            return flatten_discovery_models(families)
-    except Exception:
-        return None
     return None
 
 def _save_flat_to_disk(flat: list[dict[str, Any]], families: list | None = None) -> None:
@@ -134,6 +139,102 @@ def _save_flat_to_disk(flat: list[dict[str, Any]], families: list | None = None)
             json.dumps(families, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+
+def _load_model_capability_overrides() -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(_model_capabilities_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _apply_model_capability_overrides(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    overrides = _load_model_capability_overrides()
+    if not overrides:
+        return items
+    merged: list[dict[str, Any]] = []
+    for item in items:
+        key = f"{item.get('id') or ''}@@{item.get('version') or ''}"
+        override = overrides.get(key)
+        if not isinstance(override, dict):
+            merged.append(item)
+            continue
+        copy = dict(item)
+        for field in ("sizes", "aspect_ratios", "default_aspect_ratio", "sizes_by_aspect"):
+            if override.get(field):
+                copy[field] = override[field]
+        copy["capabilities_source"] = "learned_from_upstream"
+        merged.append(copy)
+    return merged
+
+
+def _learn_video_model_capabilities(model: str, version: str, payload: Any) -> bool:
+    """从 Adobe 验证响应中学习合法尺寸，仅持久化尺寸与比例。"""
+    sizes = parse_allowed_video_sizes(payload)
+    if not model or not sizes:
+        return False
+    key = f"{model}@@{version}"
+    with _model_capabilities_lock:
+        overrides = _load_model_capability_overrides()
+        # Adobe 的 allowed combinations 是该次验证返回的完整白名单，以最新结果覆盖旧缓存。
+        capabilities = video_capabilities_from_sizes(sizes)
+        current = overrides.get(key) or {}
+        capability_fields = (
+            "sizes",
+            "aspect_ratios",
+            "default_aspect_ratio",
+            "sizes_by_aspect",
+        )
+        if all(current.get(field) == capabilities.get(field) for field in capability_fields):
+            _models_cache.update(ts=0.0, data=None, error="")
+            return True
+        capabilities["updated_at"] = time.time()
+        overrides[key] = capabilities
+        try:
+            _model_capabilities_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = _model_capabilities_path.with_suffix(".json.tmp")
+            tmp_path.write_text(
+                json.dumps(overrides, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp_path.replace(_model_capabilities_path)
+        except Exception:
+            return False
+    _models_cache.update(ts=0.0, data=None, error="")
+    return True
+
+
+def _backfill_model_capabilities_from_logs(limit: int = 200) -> int:
+    """从已有失败日志迁移能力缓存，避免为了学习规格再次触发失败任务。"""
+    learned = 0
+    known = set(_load_model_capability_overrides())
+    for job in db.list_jobs(limit=limit):
+        if job.get("kind") not in ("video", "video_pipeline"):
+            continue
+        params = job.get("params") or {}
+        if job.get("kind") == "video_pipeline":
+            options = params.get("options") or {}
+            model = str(options.get("video_model") or "")
+            version = str(options.get("video_model_version") or "")
+        else:
+            model = str(params.get("model") or job.get("model") or "")
+            version = str(params.get("model_version") or job.get("model_version") or "")
+        if not model:
+            continue
+        key = f"{model}@@{version}"
+        if key in known:
+            continue
+        for log in db.list_logs(job_id=str(job.get("id") or ""), limit=20):
+            payload = " ".join(
+                str(value or "")
+                for value in (log.get("error"), log.get("response_body"))
+            )
+            if _learn_video_model_capabilities(model, version, payload):
+                learned += 1
+                known.add(key)
+                break
+    return learned
+
 def _fetch_live_models() -> list[dict[str, Any]]:
     token, extras = fp.require_token()
     client = fp.FireflyClient(
@@ -149,10 +250,10 @@ def _fetch_live_models() -> list[dict[str, Any]]:
             _save_flat_to_disk(flat, families)
         except Exception:
             pass
-        fp.release_token(ok=True)
+        fp.release_token(ok=True, record_stats=False)
         return flat
     except Exception as e:
-        fp.release_token(ok=False, error=str(e))
+        fp.release_token(ok=False, error=str(e), record_stats=False)
         raise
 
 def _get_models_by_kind(*, force_live: bool = False) -> tuple[dict[str, list], str, str]:
@@ -188,11 +289,94 @@ def _get_models_by_kind(*, force_live: bool = False) -> tuple[dict[str, list], s
         flat = IMAGE_MODELS + VIDEO_MODELS
         source = "preset_fallback"
 
+    flat = _apply_model_capability_overrides(flat)
     by_kind = split_by_kind(flat)
     _models_cache["ts"] = now
     _models_cache["data"] = by_kind
     _models_cache["error"] = err
     return by_kind, source, err
+
+
+def _find_video_model_spec(model: str, version: str = "") -> dict[str, Any] | None:
+    """按 modelId + modelVersion 获取 discovery 展开的精确视频能力。"""
+    try:
+        by_kind, _, _ = _get_models_by_kind(force_live=False)
+        pool = (by_kind.get("video") or []) + list(VIDEO_MODELS)
+    except Exception:
+        pool = list(VIDEO_MODELS)
+    return next(
+        (
+            item for item in pool
+            if item.get("id") == model
+            and (not version or str(item.get("version") or "") == version)
+        ),
+        None,
+    )
+
+
+def _video_size_strings(model_spec: dict[str, Any]) -> list[str]:
+    sizes = model_spec.get("sizes") or []
+    if isinstance(sizes, dict):
+        sizes = list(sizes.values())
+    if not isinstance(sizes, list):
+        return []
+    return [
+        str(size)
+        for size in sizes
+        if isinstance(size, str) and "x" in size.lower() and size != "auto"
+    ]
+
+
+def _resolve_video_spec(
+    model: str,
+    version: str,
+    aspect_ratio: Any,
+    size: Any,
+) -> tuple[str, str, str | None]:
+    """用 discovery 能力归一化比例和尺寸，阻止固定 fallback 产生非法请求。"""
+    spec = _find_video_model_spec(model, version)
+    aspect = str(aspect_ratio or "").strip()
+    requested_size = str(size or "").strip().lower()
+    if not spec:
+        return aspect, requested_size, None
+
+    allowed_aspects = [str(value) for value in (spec.get("aspect_ratios") or []) if value]
+    if aspect in ("", "auto"):
+        aspect = str(spec.get("default_aspect_ratio") or "")
+        if not aspect and allowed_aspects:
+            aspect = allowed_aspects[0]
+    if allowed_aspects and aspect not in allowed_aspects:
+        return aspect, requested_size, (
+            f"该模型不支持比例 {aspect}（支持：{allowed_aspects}）"
+        )
+
+    size_map = spec.get("sizes_by_aspect") or {}
+    if not isinstance(size_map, dict):
+        size_map = {}
+    # 离线预设历史上把 sizes 直接写成 {aspect: size}。
+    if not size_map and isinstance(spec.get("sizes"), dict):
+        size_map = spec.get("sizes") or {}
+    allowed_sizes = _video_size_strings(spec)
+    allowed_size_keys = {value.lower() for value in allowed_sizes}
+    preferred_size = str(size_map.get(aspect) or "").lower()
+
+    if requested_size in ("", "auto"):
+        requested_size = preferred_size or (allowed_sizes[0].lower() if allowed_sizes else "")
+    elif allowed_sizes and requested_size not in allowed_size_keys:
+        # 前端缓存过旧时自动纠正为该比例的首个合法尺寸。
+        if preferred_size:
+            requested_size = preferred_size
+        else:
+            return aspect, requested_size, (
+                f"该模型不支持尺寸 {size}（支持：{allowed_sizes}）"
+            )
+
+    # 部分 Adobe discovery 只返回 size 的 $ref，并不展开合法尺寸。此时允许
+    # 上游做一次能力探测；若校验响应给出 allowed combinations，任务层会学习
+    # 真实规格并立刻用合法尺寸重试同一任务。
+    if not requested_size:
+        return aspect, "", None
+    return aspect, requested_size, None
 
 def _auth_status() -> dict[str, Any]:
     """登录态摘要（公网可读）。完全从 pool 读; 不再回退到 current_token.json / storage.json."""
@@ -235,7 +419,7 @@ def _credits_status() -> dict[str, Any]:
         if not account_id:
             # token 解析不出账号 ID — 这是 token 格式问题, 不是账号失效.
             # 释放但不 cooldown, 让账号继续可用于生成.
-            fp.release_token(ok=True)
+            fp.release_token(ok=True, record_stats=False)
             data = {
                 "error": "当前账号 token 缺 user_id / aa_id / sub, 跳过额度读取",
                 "account_label": label,
@@ -257,7 +441,7 @@ def _credits_status() -> dict[str, Any]:
             timeout=20,
         )
         if response.status_code == 200:
-            fp.release_token(ok=True)
+            fp.release_token(ok=True, record_stats=False)
             payload = response.json()
             total_info = payload.get("total") if isinstance(payload, dict) else {}
             quota = total_info.get("quota") if isinstance(total_info, dict) else {}
@@ -276,17 +460,21 @@ def _credits_status() -> dict[str, Any]:
 
         # 非 200: 只在明确鉴权失败时 cooldown, 其它当元数据问题放过.
         if response.status_code in (401, 403):
-            fp.release_token(ok=False, error=f"credits HTTP {response.status_code}")
+            fp.release_token(
+                ok=False,
+                error=f"credits HTTP {response.status_code}",
+                record_stats=False,
+            )
             err = f"账号鉴权失败 (HTTP {response.status_code}), 已切换下一个账号"
         else:
-            fp.release_token(ok=True)
+            fp.release_token(ok=True, record_stats=False)
             err = f"额度暂不可读取 (HTTP {response.status_code})"
         data = {"error": err, "account_label": label, "updated_at": now}
         _credits_cache.update(ts=now, data=data)
         return data
     except Exception as e:
         # 网络错 / JSON 错 / 任何意外 — 都是元数据问题, 不动 pool.
-        fp.release_token(ok=True)
+        fp.release_token(ok=True, record_stats=False)
         data = {"error": f"额度暂不可读取: {e}", "account_label": label, "updated_at": now}
         _credits_cache.update(ts=now, data=data)
         return data
@@ -584,35 +772,75 @@ def _run_job(job_id: str) -> None:
             try:
                 data = run_upstream()
             except Exception as first_error:
-                retryable = fp.is_retryable_upstream_error(first_error)
-                terminal_failure = isinstance(first_error, fp.UpstreamTaskFailed)
-                # 已受理任务一般只轮询，避免重复生成；但上游明确给出额度/鉴权/
-                # 限流等可重试终态时，换号重投一次。
-                if not retryable or (submitted["ok"] and not terminal_failure):
-                    raise
-                # 第一次临时失败: 当前账号入冷却并释放，下一次 run_upstream 会重新取号。
-                fp.release_token(ok=False, error=str(first_error))
-                db.add_log(
-                    job_id=job_id,
-                    phase="task_retry",
-                    method="INTERNAL",
-                    url=f"generate/{kind}",
-                    status_code=0,
-                    response_body={
-                        "attempt": 1,
-                        "reason": type(first_error).__name__,
-                        "message": str(first_error)[:240],
-                        "terminal_failure": terminal_failure,
-                    },
-                    duration_ms=(time.time() - t0) * 1000,
+                learned_spec = kind == "video" and _learn_video_model_capabilities(
+                    model,
+                    version,
+                    first_error,
                 )
-                db.update_job(
-                    job_id,
-                    status="running",
-                    message="上游失败，切换账号后自动重试…",
-                    progress=15,
-                )
-                data = run_upstream()
+                if learned_spec:
+                    resolved_aspect, resolved_size, spec_error = _resolve_video_spec(
+                        model,
+                        version,
+                        params.get("aspect_ratio"),
+                        params.get("size"),
+                    )
+                    if spec_error or not resolved_size:
+                        raise first_error
+                    params["aspect_ratio"] = resolved_aspect
+                    params["size"] = resolved_size
+                    submitted["ok"] = False
+                    db.add_log(
+                        job_id=job_id,
+                        phase="task_retry",
+                        method="INTERNAL",
+                        url=f"generate/{kind}",
+                        status_code=0,
+                        response_body={
+                            "attempt": 1,
+                            "reason": "model_capabilities_learned",
+                            "aspect_ratio": resolved_aspect,
+                            "size": resolved_size,
+                        },
+                        duration_ms=(time.time() - t0) * 1000,
+                    )
+                    db.update_job(
+                        job_id,
+                        status="running",
+                        message=f"已识别模型规格，改用 {resolved_size} 自动重试…",
+                        progress=15,
+                        params=params,
+                    )
+                    data = run_upstream()
+                else:
+                    retryable = fp.is_retryable_upstream_error(first_error)
+                    terminal_failure = isinstance(first_error, fp.UpstreamTaskFailed)
+                    # 已受理任务一般只轮询，避免重复生成；但上游明确给出额度/鉴权/
+                    # 限流等可重试终态时，换号重投一次。
+                    if not retryable or (submitted["ok"] and not terminal_failure):
+                        raise
+                    # 第一次临时失败: 当前账号入冷却并释放，下一次 run_upstream 会重新取号。
+                    fp.release_token(ok=False, error=str(first_error))
+                    db.add_log(
+                        job_id=job_id,
+                        phase="task_retry",
+                        method="INTERNAL",
+                        url=f"generate/{kind}",
+                        status_code=0,
+                        response_body={
+                            "attempt": 1,
+                            "reason": type(first_error).__name__,
+                            "message": str(first_error)[:240],
+                            "terminal_failure": terminal_failure,
+                        },
+                        duration_ms=(time.time() - t0) * 1000,
+                    )
+                    db.update_job(
+                        job_id,
+                        status="running",
+                        message="上游失败，切换账号后自动重试…",
+                        progress=15,
+                    )
+                    data = run_upstream()
 
             outputs = data.get("outputs") or []
             url_count = sum(1 for o in outputs if o.get("url"))
@@ -655,6 +883,12 @@ def _run_job(job_id: str) -> None:
         except Exception as e:
             tb = traceback.format_exc()
             err_msg = str(e)
+            if kind == "video":
+                _learn_video_model_capabilities(
+                    str(params.get("model") or ""),
+                    str(params.get("model_version") or ""),
+                    err_msg,
+                )
             user_msg = fp.summarize_upstream_error(e)
             upstream_error = fp.upstream_error_details(e)
             # 把异常归类上报给连接池: 401/403/quota 等会自动 cooldown, 下一请求换账号.
@@ -817,6 +1051,18 @@ def api_generate():
         hit = next((m for m in pool if m["id"] == model), None)
         version = str((hit or {}).get("version") or ("2" if kind == "image" else "1"))
 
+    resolved_aspect = str(body.get("aspect_ratio") or "").strip()
+    resolved_size = body.get("size") or ("auto" if kind == "image" else "")
+    if kind == "video":
+        resolved_aspect, resolved_size, spec_error = _resolve_video_spec(
+            model,
+            version,
+            resolved_aspect,
+            resolved_size,
+        )
+        if spec_error:
+            return jsonify({"error": spec_error}), 400
+
     auth = _auth_status()
     if not auth.get("token_ok"):
         return (
@@ -837,10 +1083,10 @@ def api_generate():
         "model": model,
         "model_version": version,
         "n": body.get("n", 1),
-        "size": body.get("size") or ("auto" if kind == "image" else ""),
+        "size": resolved_size,
         "detail_level": body.get("detail_level", 3),
         "duration": body.get("duration"),
-        "aspect_ratio": body.get("aspect_ratio") or "",
+        "aspect_ratio": resolved_aspect,
         "generate_audio": body.get("generate_audio", True),
         "negative_prompt": body.get("negative_prompt") or "",
         "seeds": body.get("seeds") or "",
@@ -1206,12 +1452,54 @@ def _run_video_job(job_id: str) -> None:
                 status_code=0, request_body={"prompt": prompt, "options": params.get("options") or {}},
             )
 
+            def recover_model_spec(
+                model: str,
+                version: str,
+                aspect: str,
+                error: Any,
+            ) -> tuple[str, Any] | None:
+                if not _learn_video_model_capabilities(model, version, error):
+                    return None
+                resolved_aspect, resolved_size, spec_error = _resolve_video_spec(
+                    model,
+                    version,
+                    aspect,
+                    "",
+                )
+                if spec_error or not resolved_size:
+                    return None
+                options = params.get("options") or {}
+                options["aspect_ratio"] = resolved_aspect
+                options["video_size"] = resolved_size
+                params["options"] = options
+                db.update_job(
+                    job_id,
+                    status="running",
+                    message=f"已识别模型规格，改用 {resolved_size} 自动重试当前分镜…",
+                    params=params,
+                )
+                db.add_log(
+                    job_id=job_id,
+                    phase="video_retry",
+                    method="INTERNAL",
+                    url="video_pipeline",
+                    status_code=0,
+                    response_body={
+                        "reason": "model_capabilities_learned",
+                        "aspect_ratio": resolved_aspect,
+                        "size": resolved_size,
+                    },
+                    duration_ms=(time.time() - t0) * 1000,
+                )
+                return resolved_aspect, resolved_size
+
             def run_video() -> dict[str, Any]:
                 return vp.generate_full_video(
                     prompt,
                     options_dict=params.get("options") or {},
                     on_progress=_on_progress,
                     on_state=_on_state,
+                    recover_model_spec=recover_model_spec,
                     job_id=job_id,
                 )
 
@@ -1271,6 +1559,13 @@ def _run_video_job(job_id: str) -> None:
                     })
 
             errs = result.get("errors") or []
+            video_options = params.get("options") or {}
+            for error in errs:
+                _learn_video_model_capabilities(
+                    str(video_options.get("video_model") or ""),
+                    str(video_options.get("video_model_version") or ""),
+                    error,
+                )
             # 只有「最终 mp4 存在」才算 succeeded；其它统一 failed
             final_exists = bool(final_path) and Path(final_path).is_file()
             status = "succeeded" if final_exists else "failed"
@@ -1322,6 +1617,12 @@ def _run_video_job(job_id: str) -> None:
         except Exception as e:
             tb = traceback.format_exc()
             err_msg = str(e)
+            video_options = params.get("options") or {}
+            _learn_video_model_capabilities(
+                str(video_options.get("video_model") or ""),
+                str(video_options.get("video_model_version") or ""),
+                err_msg,
+            )
             fp.release_token(ok=False, error=err_msg)
             # TTS 错误用专门文案；其它走 fp.summarize_upstream_error
             if "TTS" in err_msg or "tts" in err_msg.lower():
@@ -1361,16 +1662,12 @@ def _run_video_job(job_id: str) -> None:
             )
 
 def _validate_video_options(options: dict[str, Any]) -> str | None:
-    """按已知视频模型能力校验 duration / aspect。未知模型放过。"""
+    """按 discovery 能力校验并补全一键成片的视频规格。"""
     model = str(options.get("video_model") or "").strip()
     if not model:
         return None
-    try:
-        by_kind, _, _ = _get_models_by_kind(force_live=False)
-        pool = (by_kind.get("video") or []) + list(VIDEO_MODELS)
-    except Exception:
-        pool = list(VIDEO_MODELS)
-    m = next((x for x in pool if x.get("id") == model), None)
+    version = str(options.get("video_model_version") or "").strip()
+    m = _find_video_model_spec(model, version)
     if not m:
         return None  # 未知模型让 fp 兜底，不在前端枚举过的也允许走
     dur = options.get("duration_sec")
@@ -1382,11 +1679,16 @@ def _validate_video_options(options: dict[str, Any]) -> str | None:
         allowed = m.get("durations") or []
         if allowed and dur_i not in allowed:
             return f"该模型不支持时长 {dur_i}s（支持：{allowed}）"
-    aspect = str(options.get("aspect_ratio") or "").strip()
-    if aspect:
-        allowed = m.get("aspect_ratios") or []
-        if allowed and aspect not in allowed:
-            return f"该模型不支持比例 {aspect}（支持：{allowed}）"
+    aspect, size, spec_error = _resolve_video_spec(
+        model,
+        version,
+        options.get("aspect_ratio"),
+        options.get("video_size"),
+    )
+    if spec_error:
+        return spec_error
+    options["aspect_ratio"] = aspect
+    options["video_size"] = size
     return None
 
 
@@ -1426,6 +1728,7 @@ def api_video_generate():
             "aspect_ratio": options.get("aspect_ratio") or vp.DEFAULT_ASPECT_RATIO,
             "video_model": options.get("video_model") or "",
             "video_model_version": options.get("video_model_version") or "",
+            "video_size": options.get("video_size") or "",
             "generate_audio": bool(options.get("generate_audio", True)),
             "use_llm": bool(options.get("use_llm", False)),
             "llm_model": options.get("llm_model") or "",
@@ -1477,6 +1780,7 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     recovered = _recover_orphaned_jobs()
+    learned_specs = _backfill_model_capabilities_from_logs()
     pool = get_pool()
     pool_summary = pool.status()
     try:
@@ -1498,6 +1802,7 @@ def main() -> None:
     print(f"[Firefly API] http://{host}:{port}")
     print(f"  db={DB_PATH}")
     print(f"  recovered_orphans={recovered}")
+    print(f"  learned_model_specs={learned_specs}")
     print(
         f"  accounts_pool: size={pool_summary['size']} available={pool_summary['available']}"
         + (" (池为空, 所有请求都会 400; 请到「账号池」页面上传)"

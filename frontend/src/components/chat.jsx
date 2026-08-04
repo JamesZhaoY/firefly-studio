@@ -360,7 +360,7 @@ function ParamPanel({
                           options={
                             selected.aspect_ratios?.length
                               ? selected.aspect_ratios
-                              : ['16:9', '9:16']
+                              : ['auto']
                           }
                           onChange={setAspect} />
               <ChipToggle label="音频" on={audio} onChange={setAudio} />

@@ -7,7 +7,7 @@ import { keyOf } from './util.js'
 
 const SHOT_OPTIONS = [3, 4, 5, 6]
 const DUR_OPTIONS = [4, 6, 8]
-const ASPECT_OPTIONS = ['16:9', '9:16']
+const ASPECT_OPTIONS = ['auto']
 const DEFAULT_VOICE = 'zh-CN-XiaoxiaoNeural'
 
 // 备选用 voice，避免 /api/voices 第一次还在飞时面板是空的
@@ -290,6 +290,7 @@ function FormView({ voices, llmModels, videoModels, busy, onSubmit, errorMsg }) 
     e?.preventDefault?.()
     if (!canSubmit) return
     const vid = modelParts(videoModels, videoModelKey)
+    const videoSize = selectedVideoModel?.sizes_by_aspect?.[aspect] || 'auto'
     onSubmit({
       prompt: prompt.trim(),
       options: {
@@ -297,6 +298,7 @@ function FormView({ voices, llmModels, videoModels, busy, onSubmit, errorMsg }) 
         duration_sec: duration,
         voice,
         aspect_ratio: aspect,
+        video_size: videoSize,
         generate_audio: videoSupportsAudio,
         use_llm: useLlm,
         video_model: vid.model,

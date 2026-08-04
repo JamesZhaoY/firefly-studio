@@ -33,6 +33,18 @@ def test_pool_release_and_refresh_policy() -> None:
         assert account.in_use == 0
         assert account.total_succeeded == 1
 
+        # 模型发现、额度读取等元数据请求只归还账号，不计入生成成功/失败。
+        _metadata_account, release_metadata = pool.acquire(timeout=0)
+        release_metadata(True, record_stats=False)
+        assert account.in_use == 0
+        assert account.total_succeeded == 1
+
+        _metadata_account, release_metadata_failure = pool.acquire(timeout=0)
+        release_metadata_failure(False, "credits HTTP 401", record_stats=False)
+        assert account.total_failed == 0
+        assert account.cooldown_until > time.time()
+        account.cooldown_until = 0.0
+
         account.cooldown_until = time.time() + 60
         account.last_error = "quota exhausted"
         assert not pool.should_auto_refresh(account)

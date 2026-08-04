@@ -369,12 +369,13 @@ class TokenPool:
 
     # ── 核心: acquire / release ─────────────────────────────────
 
-    def acquire(self, *, timeout: float = 30.0) -> tuple[Account, Callable[[bool, str], None]]:
+    def acquire(self, *, timeout: float = 30.0) -> tuple[Account, Callable[..., None]]:
         """阻塞直到拿到一个可用账号; 返回 (account, release_fn).
 
-        release_fn(ok: bool, error: str = "") 由调用方在请求结束时调用, 用来:
-          - ok=True  → 清空 cooldown / 累计成功
-          - ok=False → 根据 error 关键字匹配冷却时间, 累计失败
+        release_fn(ok: bool, error: str = "", record_stats: bool = True)
+        由调用方在请求结束时调用；record_stats=False 用于模型/额度等元数据请求：
+          - ok=True  → 清空 cooldown；仅 record_stats=True 时累计成功
+          - ok=False → 根据 error 关键字匹配冷却；仅 record_stats=True 时累计失败
         """
         deadline = time.time() + max(0.0, timeout)
         with self._cv:
@@ -406,7 +407,14 @@ class TokenPool:
                 return i
         return -1
 
-    def _release(self, account_id: str, ok: bool, error: str) -> None:
+    def _release(
+        self,
+        account_id: str,
+        ok: bool,
+        error: str,
+        *,
+        record_stats: bool = True,
+    ) -> None:
         with self._cv:
             acct = self._accounts.get(account_id)
             if not acct:
@@ -417,10 +425,12 @@ class TokenPool:
                 acct.cooldown_until = 0.0
                 acct.last_success_at = time.time()
                 acct.last_error = ""
-                acct.total_succeeded += 1
+                if record_stats:
+                    acct.total_succeeded += 1
                 self._cv.notify_all()
                 return
-            acct.total_failed += 1
+            if record_stats:
+                acct.total_failed += 1
             acct.last_failure_at = time.time()
             acct.last_error = (error or "")[:240]
             acct.consecutive_failures += 1
@@ -489,11 +499,17 @@ class _ReleaseFn:
         self._id = account_id
         self._called = False
 
-    def __call__(self, ok: bool, error: str = "") -> None:
+    def __call__(
+        self,
+        ok: bool,
+        error: str = "",
+        *,
+        record_stats: bool = True,
+    ) -> None:
         if self._called:
             return
         self._called = True
-        self._pool._release(self._id, ok, error)
+        self._pool._release(self._id, ok, error, record_stats=record_stats)
 
 
 def _cooldown_for_error(err: str) -> float:
